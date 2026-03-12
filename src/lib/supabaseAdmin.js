@@ -1,8 +1,14 @@
 import { createClient } from '@supabase/supabase-js';
 
-// Admin client for auth validation during migration period
+// The admin client needs a URL that serves /auth/v1 and /rest/v1
+// remax-app proxies both, so:
+//   - From remax-app itself: http://localhost:3000
+//   - From remax-worker: http://remax-crm_remax-app:3000 (Docker network)
+// Set SUPABASE_URL accordingly in each service's env vars
+const INTERNAL_URL = process.env.SUPABASE_URL || `http://localhost:${process.env.PORT || 3000}`;
+
 const supabaseAdmin = createClient(
-    process.env.SUPABASE_URL,
+    INTERNAL_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
