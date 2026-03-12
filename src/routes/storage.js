@@ -21,6 +21,11 @@ const s3 = new S3Client({
     },
 });
 
+// S3/MinIO requires hyphens in bucket names, but Supabase uses underscores
+function normalizeBucket(name) {
+    return name.replace(/_/g, '-');
+}
+
 // Helper: create a simple signed token for file access
 function createSignToken(bucket, key, expiresAt) {
     const payload = `${bucket}:${key}:${expiresAt}`;
@@ -35,7 +40,7 @@ function verifySignToken(bucket, key, expiresAt, token) {
 // POST /storage/v1/object/sign/:bucket/*path — Create signed URLs (Supabase-compatible)
 router.post('/object/sign/:bucket/*', authMiddleware, async (req, res) => {
     try {
-        const bucket = req.params.bucket;
+        const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
         const expiresIn = req.body?.expiresIn || 3600;
         const expiresAt = Date.now() + (expiresIn * 1000);
@@ -54,7 +59,7 @@ router.post('/object/sign/:bucket/*', authMiddleware, async (req, res) => {
 // GET /storage/v1/object/sign/:bucket/*path — Serve signed file (proxied from MinIO)
 router.get('/object/sign/:bucket/*', async (req, res) => {
     try {
-        const bucket = req.params.bucket;
+        const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
         const { token, expires } = req.query;
 
@@ -96,7 +101,7 @@ router.get('/object/sign/:bucket/*', async (req, res) => {
 // POST /storage/v1/object/:bucket/*path — Upload file (Supabase-compatible)
 router.post('/object/:bucket/*', authMiddleware, async (req, res) => {
     try {
-        const bucket = req.params.bucket;
+        const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
 
         // Collect raw body
@@ -123,7 +128,7 @@ router.post('/object/:bucket/*', authMiddleware, async (req, res) => {
 // PUT /storage/v1/object/:bucket/*path — Upload/update file
 router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
     try {
-        const bucket = req.params.bucket;
+        const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
 
         const chunks = [];
@@ -149,7 +154,7 @@ router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
 // DELETE /storage/v1/object/:bucket — Remove files (Supabase sends { prefixes: [...] })
 router.delete('/object/:bucket', authMiddleware, async (req, res) => {
     try {
-        const bucket = req.params.bucket;
+        const bucket = normalizeBucket(req.params.bucket);
         const { prefixes } = req.body || {};
 
         if (Array.isArray(prefixes) && prefixes.length > 0) {
@@ -169,7 +174,7 @@ router.delete('/object/:bucket', authMiddleware, async (req, res) => {
 // GET /storage/v1/object/public/:bucket/*path — Download public file (proxied)
 router.get('/object/public/:bucket/*', async (req, res) => {
     try {
-        const bucket = req.params.bucket;
+        const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
 
         const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
@@ -187,7 +192,7 @@ router.get('/object/public/:bucket/*', async (req, res) => {
 // GET /storage/v1/object/authenticated/:bucket/*path — Download authenticated file
 router.get('/object/authenticated/:bucket/*', authMiddleware, async (req, res) => {
     try {
-        const bucket = req.params.bucket;
+        const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
 
         const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
