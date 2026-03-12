@@ -15,8 +15,8 @@ const GMAIL_SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
 ].join(' ');
 
-// GET /api/gmail/auth-url — Generate Gmail OAuth URL
-router.get('/auth-url', authMiddleware, async (req, res) => {
+// Generate Gmail OAuth URL (supports both GET and POST for frontend compatibility)
+const handleAuthUrl = async (req, res) => {
     try {
         const agentId = req.user.id;
         const url = new URL('https://accounts.google.com/o/oauth2/v2/auth');
@@ -32,9 +32,70 @@ router.get('/auth-url', authMiddleware, async (req, res) => {
     } catch (error) {
         res.status(400).json({ error: error.message });
     }
-});
+};
+router.get('/auth-url', authMiddleware, handleAuthUrl);
+router.post('/auth-url', authMiddleware, handleAuthUrl);
 
-// GET /api/gmail/callback — Handle Gmail OAuth callback
+// Process Gmail OAuth callback (shared logic)
+const processGmailCallback = async (code, agentId) => {
+    // Exchange code for tokens
+    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            code,
+            client_id: GOOGLE_CLIENT_ID,
+            client_secret: GOOGLE_CLIENT_SECRET,
+            redirect_uri: GOOGLE_GMAIL_REDIRECT_URI,
+            grant_type: 'authorization_code',
+        }),
+    });
+
+    const tokens = await tokenResponse.json();
+    if (tokens.error) {
+        throw new Error(tokens.error_description || tokens.error);
+    }
+
+    // Get user email
+    const profileRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/profile', {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
+    });
+    const gmailProfile = await profileRes.json();
+
+    // Save to gmail_accounts
+    await supabaseAdmin.from('gmail_accounts').upsert({
+        agent_id: agentId,
+        email_address: gmailProfile.emailAddress,
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        last_history_id: gmailProfile.historyId,
+        updated_at: new Date().toISOString(),
+    }, { onConflict: 'agent_id' });
+
+    // Setup Gmail push notifications (Pub/Sub watch)
+    const watchRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/watch', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${tokens.access_token}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            topicName: process.env.GOOGLE_PUBSUB_TOPIC,
+            labelIds: ['INBOX'],
+        }),
+    });
+
+    const watchData = await watchRes.json();
+    if (watchData.historyId) {
+        await supabaseAdmin.from('gmail_accounts')
+            .update({ last_history_id: watchData.historyId, watch_expiration: watchData.expiration })
+            .eq('agent_id', agentId);
+    }
+
+    return { success: true, email: gmailProfile.emailAddress };
+};
+
+// GET /api/gmail/callback — Handle Gmail OAuth callback (browser redirect)
 router.get('/callback', async (req, res) => {
     try {
         const { code, state: agentId } = req.query;
@@ -42,63 +103,28 @@ router.get('/callback', async (req, res) => {
             return res.status(400).json({ error: 'Missing code or state' });
         }
 
-        // Exchange code for tokens
-        const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-                code,
-                client_id: GOOGLE_CLIENT_ID,
-                client_secret: GOOGLE_CLIENT_SECRET,
-                redirect_uri: GOOGLE_GMAIL_REDIRECT_URI,
-                grant_type: 'authorization_code',
-            }),
-        });
-
-        const tokens = await tokenResponse.json();
-        if (tokens.error) {
-            return res.status(400).json({ error: tokens.error_description || tokens.error });
-        }
-
-        // Get user email
-        const profileRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/profile', {
-            headers: { Authorization: `Bearer ${tokens.access_token}` },
-        });
-        const gmailProfile = await profileRes.json();
-
-        // Save to gmail_accounts
-        await supabaseAdmin.from('gmail_accounts').upsert({
-            agent_id: agentId,
-            email_address: gmailProfile.emailAddress,
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            last_history_id: gmailProfile.historyId,
-            updated_at: new Date().toISOString(),
-        }, { onConflict: 'agent_id' });
-
-        // Setup Gmail push notifications (Pub/Sub watch)
-        const watchRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/watch', {
-            method: 'POST',
-            headers: {
-                Authorization: `Bearer ${tokens.access_token}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                topicName: process.env.GOOGLE_PUBSUB_TOPIC,
-                labelIds: ['INBOX'],
-            }),
-        });
-
-        const watchData = await watchRes.json();
-        if (watchData.historyId) {
-            await supabaseAdmin.from('gmail_accounts')
-                .update({ last_history_id: watchData.historyId, watch_expiration: watchData.expiration })
-                .eq('agent_id', agentId);
-        }
+        await processGmailCallback(code, agentId);
 
         // Redirect back to app
         const frontendUrl = process.env.FRONTEND_URL || 'https://solicitudes.remax-exclusive.cl';
         res.redirect(`${frontendUrl}/casilla?gmail=connected`);
+    } catch (error) {
+        console.error('Gmail callback error:', error);
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// POST /api/gmail/callback — Handle Gmail OAuth callback (frontend API call)
+router.post('/callback', authMiddleware, async (req, res) => {
+    try {
+        const { code } = req.body;
+        const agentId = req.user.id;
+        if (!code) {
+            return res.status(400).json({ error: 'Missing code' });
+        }
+
+        const result = await processGmailCallback(code, agentId);
+        res.json(result);
     } catch (error) {
         console.error('Gmail callback error:', error);
         res.status(400).json({ error: error.message });
