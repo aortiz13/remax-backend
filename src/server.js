@@ -46,13 +46,20 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(helmet({ contentSecurityPolicy: false }));
+// Helmet ONLY for non-proxy API routes (applied later)
+// NOT here — it adds cross-origin-resource-policy: same-origin
+// which blocks cross-origin fetch from the browser
 
-// Helper: inject CORS headers into proxied responses
+// Helper: inject CORS headers AND remove blocking headers from proxied responses
 const onProxyRes = (proxyRes) => {
     Object.entries(CORS_HEADERS).forEach(([k, v]) => {
         proxyRes.headers[k] = v;
     });
+    // Remove headers that block cross-origin access
+    delete proxyRes.headers['cross-origin-resource-policy'];
+    delete proxyRes.headers['cross-origin-opener-policy'];
+    delete proxyRes.headers['cross-origin-embedder-policy'];
+    delete proxyRes.headers['x-frame-options'];
 };
 
 // =============================================
@@ -95,7 +102,15 @@ app.use('/storage/v1/object/public', createProxyMiddleware({
     },
 }));
 
-// Body parser (after proxies so they handle their own body parsing)
+// =============================================
+// MIDDLEWARE for API routes (after proxies)
+// =============================================
+app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: false,
+    crossOriginOpenerPolicy: false,
+    crossOriginEmbedderPolicy: false,
+}));
 app.use(express.json({ limit: '50mb' }));
 
 // Health check
