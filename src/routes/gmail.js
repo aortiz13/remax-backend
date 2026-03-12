@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
-import supabaseAdmin from '../lib/supabaseAdmin.js';
+import pool from '../lib/db.js';
 import { emailQueue } from '../queues/index.js';
 
 const router = Router();
@@ -15,7 +15,7 @@ const GMAIL_SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
 ].join(' ');
 
-// Generate Gmail OAuth URL (supports both GET and POST for frontend compatibility)
+// Generate Gmail OAuth URL (supports both GET and POST)
 const handleAuthUrl = async (req, res) => {
     try {
         const agentId = req.user.id;
@@ -36,7 +36,7 @@ const handleAuthUrl = async (req, res) => {
 router.get('/auth-url', authMiddleware, handleAuthUrl);
 router.post('/auth-url', authMiddleware, handleAuthUrl);
 
-// Process Gmail OAuth callback (shared logic)
+// Process Gmail OAuth callback (shared logic using direct SQL)
 const processGmailCallback = async (code, agentId) => {
     // Exchange code for tokens
     const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
@@ -56,21 +56,30 @@ const processGmailCallback = async (code, agentId) => {
         throw new Error(tokens.error_description || tokens.error);
     }
 
+    console.log('[Gmail] Got tokens for agent:', agentId);
+
     // Get user email
     const profileRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/profile', {
         headers: { Authorization: `Bearer ${tokens.access_token}` },
     });
     const gmailProfile = await profileRes.json();
+    console.log('[Gmail] Profile email:', gmailProfile.emailAddress);
 
-    // Save to gmail_accounts
-    await supabaseAdmin.from('gmail_accounts').upsert({
-        agent_id: agentId,
-        email_address: gmailProfile.emailAddress,
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        last_history_id: gmailProfile.historyId,
-        updated_at: new Date().toISOString(),
-    }, { onConflict: 'agent_id' });
+    // Save to gmail_accounts via direct SQL (bypasses PostgREST/RLS)
+    const upsertResult = await pool.query(`
+        INSERT INTO gmail_accounts (agent_id, email_address, access_token, refresh_token, last_history_id, updated_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (agent_id)
+        DO UPDATE SET
+            email_address = EXCLUDED.email_address,
+            access_token = EXCLUDED.access_token,
+            refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_accounts.refresh_token),
+            last_history_id = EXCLUDED.last_history_id,
+            updated_at = NOW()
+        RETURNING email_address, updated_at
+    `, [agentId, gmailProfile.emailAddress, tokens.access_token, tokens.refresh_token, gmailProfile.historyId]);
+
+    console.log('[Gmail] Upsert result:', upsertResult.rows[0]);
 
     // Setup Gmail push notifications (Pub/Sub watch)
     const watchRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/watch', {
@@ -86,10 +95,13 @@ const processGmailCallback = async (code, agentId) => {
     });
 
     const watchData = await watchRes.json();
+    console.log('[Gmail] Watch result:', JSON.stringify(watchData));
+
     if (watchData.historyId) {
-        await supabaseAdmin.from('gmail_accounts')
-            .update({ last_history_id: watchData.historyId, watch_expiration: watchData.expiration })
-            .eq('agent_id', agentId);
+        await pool.query(
+            `UPDATE gmail_accounts SET last_history_id = $1, updated_at = NOW() WHERE agent_id = $2`,
+            [watchData.historyId, agentId]
+        );
     }
 
     return { success: true, email: gmailProfile.emailAddress };
@@ -105,12 +117,12 @@ router.get('/callback', async (req, res) => {
 
         await processGmailCallback(code, agentId);
 
-        // Redirect back to app
         const frontendUrl = process.env.FRONTEND_URL || 'https://solicitudes.remax-exclusive.cl';
         res.redirect(`${frontendUrl}/casilla?gmail=connected`);
     } catch (error) {
-        console.error('Gmail callback error:', error);
-        res.status(400).json({ error: error.message });
+        console.error('[Gmail] Callback error:', error);
+        const frontendUrl = process.env.FRONTEND_URL || 'https://solicitudes.remax-exclusive.cl';
+        res.redirect(`${frontendUrl}/casilla?gmail=error&msg=${encodeURIComponent(error.message)}`);
     }
 });
 
@@ -126,7 +138,7 @@ router.post('/callback', authMiddleware, async (req, res) => {
         const result = await processGmailCallback(code, agentId);
         res.json(result);
     } catch (error) {
-        console.error('Gmail callback error:', error);
+        console.error('[Gmail] Callback error:', error);
         res.status(400).json({ error: error.message });
     }
 });
@@ -137,7 +149,6 @@ router.post('/send', authMiddleware, async (req, res) => {
         const agentId = req.user.id;
         const emailData = req.body;
 
-        // Enqueue the email sending job
         await emailQueue.add('send-email', {
             agentId,
             ...emailData,
