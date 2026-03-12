@@ -69,9 +69,9 @@ const processGmailCallback = async (code, agentId) => {
     const upsertResult = await pool.query(`
         INSERT INTO gmail_accounts (agent_id, email_address, access_token, refresh_token, last_history_id, updated_at)
         VALUES ($1, $2, $3, $4, $5, NOW())
-        ON CONFLICT (agent_id)
+        ON CONFLICT (email_address)
         DO UPDATE SET
-            email_address = EXCLUDED.email_address,
+            agent_id = EXCLUDED.agent_id,
             access_token = EXCLUDED.access_token,
             refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_accounts.refresh_token),
             last_history_id = EXCLUDED.last_history_id,
