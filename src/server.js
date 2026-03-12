@@ -15,6 +15,7 @@ import inviteRoutes from './routes/invite.js';
 import webhookRoutes from './routes/webhooks.js';
 import notificationRoutes from './routes/notifications.js';
 import ttsRoutes from './routes/tts.js';
+import storageRoutes from './routes/storage.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -90,17 +91,8 @@ app.use('/rest/v1', createProxyMiddleware({
     },
 }));
 
-// /storage/v1/object/public/* → MinIO (public file access)
-app.use('/storage/v1/object/public', createProxyMiddleware({
-    target: MINIO_INTERNAL_URL,
-    changeOrigin: true,
-    pathRewrite: { '^/storage/v1/object/public': '' },
-    onProxyRes,
-    onError: (err, req, res) => {
-        console.error('Storage proxy error:', err.message);
-        res.status(502).json({ error: 'Storage service unavailable' });
-    },
-}));
+// /storage/v1/* → Supabase Storage-compatible API (MinIO backend)
+app.use('/storage/v1', storageRoutes);
 
 // =============================================
 // MIDDLEWARE for API routes (after proxies)
