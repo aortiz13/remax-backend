@@ -156,6 +156,32 @@ app.use('/api/webhooks', webhookRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/tts', ttsRoutes);
 
+// Legacy Supabase Edge Function path fallback
+// Maps /functions/v1/<name> → /api/<route> for old frontend clients
+const LEGACY_FUNCTION_MAP = {
+    'google-calendar-sync': '/api/calendar/sync',
+    'gmail-auth-url': '/api/gmail/auth-url',
+    'gmail-auth-callback': '/api/gmail/callback',
+    'gmail-send': '/api/gmail/send',
+    'invite-agent': '/api/invite/agent',
+    'admin-action': '/api/admin/action',
+    'import-remax-listings': '/api/import/remax-listings',
+    'google-auth': '/api/auth/google',
+    'slack-error-alert': '/api/notifications/slack-alert',
+    'generate-tts': '/api/tts/generate',
+    'send-notification': '/api/notifications/send',
+};
+
+app.all('/functions/v1/:functionName', (req, res) => {
+    const route = LEGACY_FUNCTION_MAP[req.params.functionName];
+    if (!route) {
+        return res.status(404).json({ error: `Unknown function: ${req.params.functionName}` });
+    }
+    // Internally redirect to the correct route
+    req.url = route;
+    app.handle(req, res);
+});
+
 // Global error handler
 app.use((err, req, res, next) => {
     console.error('❌ Unhandled error:', err);
