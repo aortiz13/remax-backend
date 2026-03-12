@@ -1,9 +1,11 @@
 import { Router } from 'express';
+import express from 'express';
 import crypto from 'crypto';
 import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import authMiddleware from '../middleware/auth.js';
 
 const router = Router();
+const jsonParser = express.json({ limit: '10mb' }); // Only for routes that need JSON body
 
 const MINIO_ENDPOINT = process.env.MINIO_ENDPOINT || 'remax-storage';
 const MINIO_PORT = process.env.MINIO_PORT || '9000';
@@ -38,7 +40,7 @@ function verifySignToken(bucket, key, expiresAt, token) {
 }
 
 // POST /storage/v1/object/sign/:bucket/*path — Create signed URLs (Supabase-compatible)
-router.post('/object/sign/:bucket/*', authMiddleware, async (req, res) => {
+router.post('/object/sign/:bucket/*', jsonParser, authMiddleware, async (req, res) => {
     try {
         const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
@@ -158,7 +160,7 @@ router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
 });
 
 // DELETE /storage/v1/object/:bucket — Remove files (Supabase sends { prefixes: [...] })
-router.delete('/object/:bucket', authMiddleware, async (req, res) => {
+router.delete('/object/:bucket', jsonParser, authMiddleware, async (req, res) => {
     try {
         const bucket = normalizeBucket(req.params.bucket);
         const { prefixes } = req.body || {};
