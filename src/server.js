@@ -91,8 +91,7 @@ app.use('/rest/v1', createProxyMiddleware({
     },
 }));
 
-// /storage/v1/* → Supabase Storage-compatible API (MinIO backend)
-app.use('/storage/v1', storageRoutes);
+// Storage routes registered after body parser below
 
 // =============================================
 // MIDDLEWARE for API routes (after proxies)
@@ -104,6 +103,10 @@ app.use(helmet({
     crossOriginEmbedderPolicy: false,
 }));
 app.use(express.json({ limit: '50mb' }));
+
+// /storage/v1/* → Supabase Storage-compatible API (MinIO backend)
+// Must be after express.json() for req.body parsing
+app.use('/storage/v1', storageRoutes);
 
 // Health check
 app.get('/api/health', async (req, res) => {
