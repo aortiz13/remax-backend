@@ -1,6 +1,6 @@
 import { Router } from 'express';
-import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand, DeleteObjectsCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import crypto from 'crypto';
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import authMiddleware from '../middleware/auth.js';
 
 const router = Router();
@@ -9,7 +9,7 @@ const MINIO_ENDPOINT = process.env.MINIO_ENDPOINT || 'remax-storage';
 const MINIO_PORT = process.env.MINIO_PORT || '9000';
 const MINIO_ACCESS_KEY = process.env.MINIO_ROOT_USER || process.env.MINIO_ACCESS_KEY || 'minioadmin';
 const MINIO_SECRET_KEY = process.env.MINIO_ROOT_PASSWORD || process.env.MINIO_SECRET_KEY || 'minioadmin';
-const MINIO_PUBLIC_URL = process.env.MINIO_PUBLIC_URL || `https://remax-crm-remax-storage.jzuuqr.easypanel.host`;
+const SIGN_SECRET = process.env.GOTRUE_JWT_SECRET || 'storage-sign-secret';
 
 const s3 = new S3Client({
     region: 'us-east-1',
@@ -21,27 +21,71 @@ const s3 = new S3Client({
     },
 });
 
+// Helper: create a simple signed token for file access
+function createSignToken(bucket, key, expiresAt) {
+    const payload = `${bucket}:${key}:${expiresAt}`;
+    return crypto.createHmac('sha256', SIGN_SECRET).update(payload).digest('hex');
+}
+
+function verifySignToken(bucket, key, expiresAt, token) {
+    const expected = createSignToken(bucket, key, expiresAt);
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(token)) && Date.now() < expiresAt;
+}
+
 // POST /storage/v1/object/sign/:bucket/*path — Create signed URLs (Supabase-compatible)
 router.post('/object/sign/:bucket/*', authMiddleware, async (req, res) => {
     try {
         const bucket = req.params.bucket;
-        const key = req.params[0]; // wildcard path
-        const { expiresIn } = req.body;
-        const expiry = expiresIn || 3600;
+        const key = req.params[0];
+        const expiresIn = req.body?.expiresIn || 3600;
+        const expiresAt = Date.now() + (expiresIn * 1000);
+        const token = createSignToken(bucket, key, expiresAt);
 
-        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-        const signedUrl = await getSignedUrl(s3, command, { expiresIn: expiry });
+        // Return a relative path — Supabase client prepends the base URL
+        const signedURL = `/storage/v1/object/sign/${bucket}/${key}?token=${token}&expires=${expiresAt}`;
 
-        // Replace internal URL with public URL
-        const publicUrl = signedUrl.replace(`http://${MINIO_ENDPOINT}:${MINIO_PORT}`, MINIO_PUBLIC_URL);
-
-        res.json({
-            signedURL: publicUrl,
-            signedUrl: publicUrl, // Supabase client uses both
-        });
+        res.json({ signedURL });
     } catch (error) {
         console.error('Storage sign error:', error.message);
         res.status(400).json({ error: error.message });
+    }
+});
+
+// GET /storage/v1/object/sign/:bucket/*path — Serve signed file (proxied from MinIO)
+router.get('/object/sign/:bucket/*', async (req, res) => {
+    try {
+        const bucket = req.params.bucket;
+        const key = req.params[0];
+        const { token, expires } = req.query;
+
+        if (!token || !expires || !verifySignToken(bucket, key, parseInt(expires), token)) {
+            return res.status(403).json({ error: 'Invalid or expired signed URL' });
+        }
+
+        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+        const response = await s3.send(command);
+
+        // Determine content type from key
+        const ext = key.split('.').pop()?.toLowerCase();
+        const contentTypes = {
+            pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+            gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+            doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            xlsm: 'application/vnd.ms-excel.sheet.macroEnabled.12',
+            ppt: 'application/vnd.ms-powerpoint', pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            mp4: 'video/mp4', mp3: 'audio/mpeg', wav: 'audio/wav',
+            zip: 'application/zip', txt: 'text/plain', csv: 'text/csv',
+        };
+
+        res.set('Content-Type', response.ContentType || contentTypes[ext] || 'application/octet-stream');
+        if (response.ContentLength) res.set('Content-Length', String(response.ContentLength));
+        res.set('Cache-Control', 'private, max-age=3600');
+
+        response.Body.pipe(res);
+    } catch (error) {
+        console.error('Storage signed download error:', error.message);
+        res.status(404).json({ error: 'File not found' });
     }
 });
 
@@ -58,26 +102,21 @@ router.post('/object/:bucket/*', authMiddleware, async (req, res) => {
         }
         const body = Buffer.concat(chunks);
 
-        const command = new PutObjectCommand({
+        await s3.send(new PutObjectCommand({
             Bucket: bucket,
             Key: key,
             Body: body,
             ContentType: req.headers['content-type'] || 'application/octet-stream',
-        });
+        }));
 
-        await s3.send(command);
-
-        res.json({
-            Key: `${bucket}/${key}`,
-            Id: key,
-        });
+        res.json({ Key: `${bucket}/${key}`, Id: key });
     } catch (error) {
         console.error('Storage upload error:', error.message);
         res.status(400).json({ error: error.message });
     }
 });
 
-// PUT /storage/v1/object/:bucket/*path — Upload/update file (alternative)
+// PUT /storage/v1/object/:bucket/*path — Upload/update file
 router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
     try {
         const bucket = req.params.bucket;
@@ -89,14 +128,13 @@ router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
         }
         const body = Buffer.concat(chunks);
 
-        const command = new PutObjectCommand({
+        await s3.send(new PutObjectCommand({
             Bucket: bucket,
             Key: key,
             Body: body,
             ContentType: req.headers['content-type'] || 'application/octet-stream',
-        });
+        }));
 
-        await s3.send(command);
         res.json({ Key: `${bucket}/${key}`, Id: key });
     } catch (error) {
         console.error('Storage update error:', error.message);
@@ -104,20 +142,17 @@ router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
     }
 });
 
-// DELETE /storage/v1/object/:bucket — Remove files (Supabase sends array of paths)
+// DELETE /storage/v1/object/:bucket — Remove files (Supabase sends { prefixes: [...] })
 router.delete('/object/:bucket', authMiddleware, async (req, res) => {
     try {
         const bucket = req.params.bucket;
-        const { prefixes } = req.body; // Supabase client sends { prefixes: [...paths] }
+        const { prefixes } = req.body || {};
 
-        if (Array.isArray(prefixes)) {
-            const deleteParams = {
+        if (Array.isArray(prefixes) && prefixes.length > 0) {
+            await s3.send(new DeleteObjectsCommand({
                 Bucket: bucket,
-                Delete: {
-                    Objects: prefixes.map(p => ({ Key: p })),
-                },
-            };
-            await s3.send(new DeleteObjectsCommand(deleteParams));
+                Delete: { Objects: prefixes.map(p => ({ Key: p })) },
+            }));
         }
 
         res.json([]);
@@ -127,14 +162,13 @@ router.delete('/object/:bucket', authMiddleware, async (req, res) => {
     }
 });
 
-// GET /storage/v1/object/public/:bucket/*path — Download public file
+// GET /storage/v1/object/public/:bucket/*path — Download public file (proxied)
 router.get('/object/public/:bucket/*', async (req, res) => {
     try {
         const bucket = req.params.bucket;
         const key = req.params[0];
 
-        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-        const response = await s3.send(command);
+        const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
 
         res.set('Content-Type', response.ContentType || 'application/octet-stream');
         if (response.ContentLength) res.set('Content-Length', String(response.ContentLength));
@@ -146,33 +180,13 @@ router.get('/object/public/:bucket/*', async (req, res) => {
     }
 });
 
-// GET /storage/v1/object/sign/:bucket/*path — Redirect to signed URL 
-router.get('/object/sign/:bucket/*', async (req, res) => {
-    try {
-        const bucket = req.params.bucket;
-        const key = req.params[0];
-        const token = req.query.token;
-
-        // If there's a token query param, it's a pre-signed URL redirect
-        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-        const signedUrl = await getSignedUrl(s3, command, { expiresIn: 3600 });
-        const publicUrl = signedUrl.replace(`http://${MINIO_ENDPOINT}:${MINIO_PORT}`, MINIO_PUBLIC_URL);
-
-        res.redirect(publicUrl);
-    } catch (error) {
-        console.error('Storage sign redirect error:', error.message);
-        res.status(404).json({ error: 'File not found' });
-    }
-});
-
 // GET /storage/v1/object/authenticated/:bucket/*path — Download authenticated file
 router.get('/object/authenticated/:bucket/*', authMiddleware, async (req, res) => {
     try {
         const bucket = req.params.bucket;
         const key = req.params[0];
 
-        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-        const response = await s3.send(command);
+        const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
 
         res.set('Content-Type', response.ContentType || 'application/octet-stream');
         if (response.ContentLength) res.set('Content-Length', String(response.ContentLength));
