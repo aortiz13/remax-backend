@@ -41,8 +41,8 @@ router.post('/object/sign/:bucket/*', authMiddleware, async (req, res) => {
         const expiresAt = Date.now() + (expiresIn * 1000);
         const token = createSignToken(bucket, key, expiresAt);
 
-        // Return a relative path — Supabase client prepends the base URL
-        const signedURL = `/storage/v1/object/sign/${bucket}/${key}?token=${token}&expires=${expiresAt}`;
+        // Return a relative path — Supabase client prepends {baseUrl}/storage/v1
+        const signedURL = `/object/sign/${bucket}/${key}?token=${token}&expires=${expiresAt}`;
 
         res.json({ signedURL });
     } catch (error) {
