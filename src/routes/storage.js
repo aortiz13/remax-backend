@@ -90,6 +90,12 @@ router.get('/object/sign/:bucket/*', async (req, res) => {
         res.set('Content-Type', response.ContentType || contentTypes[ext] || 'application/octet-stream');
         if (response.ContentLength) res.set('Content-Length', String(response.ContentLength));
         res.set('Cache-Control', 'private, max-age=3600');
+        // Allow iframe embedding for preview
+        res.removeHeader('X-Frame-Options');
+        res.removeHeader('Content-Security-Policy');
+        res.removeHeader('Cross-Origin-Embedder-Policy');
+        res.set('Content-Disposition', 'inline');
+        res.set('X-Content-Type-Options', 'nosniff');
 
         response.Body.pipe(res);
     } catch (error) {
