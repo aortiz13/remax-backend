@@ -1,11 +1,12 @@
 import jwt from 'jsonwebtoken';
 
 const JWT_SECRET = process.env.GOTRUE_JWT_SECRET || process.env.PGRST_JWT_SECRET;
+const GOTRUE_URL = process.env.GOTRUE_URL || 'http://remax-auth:9999';
 
 /**
- * Express middleware to verify GoTrue JWT token from Authorization header.
- * Verifies the JWT directly using the shared secret (no HTTP calls needed).
- * Attaches user info to req.user
+ * Express middleware to verify GoTrue JWT token.
+ * Strategy 1: Verify JWT directly if secret is available (fastest)
+ * Strategy 2: Call GoTrue /user endpoint as fallback
  */
 export default async function authMiddleware(req, res, next) {
     const authHeader = req.headers.authorization;
@@ -22,26 +23,46 @@ export default async function authMiddleware(req, res, next) {
         return next();
     }
 
-    try {
-        // Verify JWT directly using the shared secret
-        const payload = jwt.verify(token, JWT_SECRET);
+    // Strategy 1: Direct JWT verification (if secret is configured)
+    if (JWT_SECRET) {
+        try {
+            const payload = jwt.verify(token, JWT_SECRET);
+            req.user = {
+                id: payload.sub,
+                email: payload.email,
+                role: payload.role,
+                aud: payload.aud,
+                app_metadata: payload.app_metadata || {},
+                user_metadata: payload.user_metadata || {},
+            };
+            req.supabaseToken = token;
+            return next();
+        } catch (err) {
+            // If JWT verification fails, fall through to GoTrue
+            console.warn('JWT verify failed, trying GoTrue:', err.message);
+        }
+    }
 
-        // Build user object from JWT claims (matches GoTrue token structure)
-        req.user = {
-            id: payload.sub,
-            email: payload.email,
-            role: payload.role,
-            aud: payload.aud,
-            app_metadata: payload.app_metadata || {},
-            user_metadata: payload.user_metadata || {},
-        };
+    // Strategy 2: Call GoTrue /user endpoint
+    try {
+        const response = await fetch(`${GOTRUE_URL}/user`, {
+            headers: { Authorization: `Bearer ${token}`, apikey: token },
+        });
+
+        if (!response.ok) {
+            return res.status(401).json({ error: 'Invalid or expired token' });
+        }
+
+        const user = await response.json();
+        if (!user || !user.id) {
+            return res.status(401).json({ error: 'Invalid or expired token' });
+        }
+
+        req.user = user;
         req.supabaseToken = token;
         next();
     } catch (err) {
-        if (err.name === 'TokenExpiredError') {
-            return res.status(401).json({ error: 'Token expired' });
-        }
         console.error('Auth middleware error:', err.message);
-        res.status(401).json({ error: 'Invalid or expired token' });
+        res.status(401).json({ error: 'Authentication failed' });
     }
 }
