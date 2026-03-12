@@ -25,6 +25,16 @@ const POSTGREST_URL = process.env.POSTGREST_URL || 'http://remax-rest:3001';
 const MINIO_INTERNAL_URL = `http://${process.env.MINIO_ENDPOINT || 'remax-storage'}:${process.env.MINIO_PORT || '9000'}`;
 
 // =============================================
+// MIDDLEWARE — MUST be before proxies for CORS
+// =============================================
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'apikey', 'x-client-info', 'x-supabase-api-version', 'range', 'prefer'],
+}));
+
+// =============================================
 // REVERSE PROXY — Supabase-compatible paths
 // These make @supabase/supabase-js work seamlessly
 // =============================================
@@ -62,15 +72,7 @@ app.use('/storage/v1/object/public', createProxyMiddleware({
     },
 }));
 
-// =============================================
-// MIDDLEWARE
-// =============================================
-app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'apikey', 'x-client-info', 'x-supabase-api-version', 'range', 'prefer'],
-}));
+// Body parser (after proxies so they handle their own body parsing)
 app.use(express.json({ limit: '50mb' }));
 
 // Health check
