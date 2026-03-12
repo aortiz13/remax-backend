@@ -25,18 +25,38 @@ const POSTGREST_URL = process.env.POSTGREST_URL || 'http://remax-rest:3001';
 const MINIO_INTERNAL_URL = `http://${process.env.MINIO_ENDPOINT || 'remax-storage'}:${process.env.MINIO_PORT || '9000'}`;
 
 // =============================================
-// MIDDLEWARE — MUST be before proxies for CORS
+// CORS — inject headers into ALL responses
 // =============================================
+const CORS_HEADERS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, x-client-info, x-supabase-api-version, range, prefer, x-upsert',
+    'Access-Control-Expose-Headers': 'content-range, x-supabase-api-version',
+};
+
+// Handle ALL preflight OPTIONS globally
+app.options('*', (req, res) => {
+    Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
+    res.status(204).end();
+});
+
+// Add CORS headers to every response
+app.use((req, res, next) => {
+    Object.entries(CORS_HEADERS).forEach(([k, v]) => res.setHeader(k, v));
+    next();
+});
+
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'apikey', 'x-client-info', 'x-supabase-api-version', 'range', 'prefer'],
-}));
+
+// Helper: inject CORS headers into proxied responses
+const onProxyRes = (proxyRes) => {
+    Object.entries(CORS_HEADERS).forEach(([k, v]) => {
+        proxyRes.headers[k] = v;
+    });
+};
 
 // =============================================
 // REVERSE PROXY — Supabase-compatible paths
-// These make @supabase/supabase-js work seamlessly
 // =============================================
 
 // /auth/v1/* → GoTrue
@@ -44,6 +64,7 @@ app.use('/auth/v1', createProxyMiddleware({
     target: GOTRUE_URL,
     changeOrigin: true,
     pathRewrite: { '^/auth/v1': '' },
+    onProxyRes,
     onError: (err, req, res) => {
         console.error('Auth proxy error:', err.message);
         res.status(502).json({ error: 'Auth service unavailable' });
@@ -55,6 +76,7 @@ app.use('/rest/v1', createProxyMiddleware({
     target: POSTGREST_URL,
     changeOrigin: true,
     pathRewrite: { '^/rest/v1': '' },
+    onProxyRes,
     onError: (err, req, res) => {
         console.error('REST proxy error:', err.message);
         res.status(502).json({ error: 'REST service unavailable' });
@@ -66,6 +88,7 @@ app.use('/storage/v1/object/public', createProxyMiddleware({
     target: MINIO_INTERNAL_URL,
     changeOrigin: true,
     pathRewrite: { '^/storage/v1/object/public': '' },
+    onProxyRes,
     onError: (err, req, res) => {
         console.error('Storage proxy error:', err.message);
         res.status(502).json({ error: 'Storage service unavailable' });
@@ -81,14 +104,12 @@ app.get('/api/health', async (req, res) => {
         const dbResult = await pool.query('SELECT 1 AS ok');
         const redisOk = redis.status === 'ready';
 
-        // Check GoTrue
         let authOk = false;
         try {
             const authRes = await fetch(`${GOTRUE_URL}/health`);
             authOk = authRes.ok;
         } catch { }
 
-        // Check PostgREST
         let restOk = false;
         try {
             const restRes = await fetch(`${POSTGREST_URL}/`);
