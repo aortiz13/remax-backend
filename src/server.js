@@ -85,9 +85,48 @@ app.use('/rest/v1', createProxyMiddleware({
     target: POSTGREST_URL,
     changeOrigin: true,
     pathRewrite: { '^/rest/v1': '' },
-    onProxyRes,
+    selfHandleResponse: false,
+    onProxyRes: (proxyRes, req) => {
+        // Apply standard CORS headers
+        onProxyRes(proxyRes);
+
+        // Log 4xx/5xx PostgREST errors to Slack (except PGRST116 = .single() with 0 rows)
+        if (proxyRes.statusCode >= 400) {
+            const chunks = [];
+            proxyRes.on('data', (chunk) => chunks.push(chunk));
+            proxyRes.on('end', () => {
+                try {
+                    const body = Buffer.concat(chunks).toString('utf8');
+                    const parsed = JSON.parse(body);
+                    // Skip PGRST116 (no rows for .single()) — it's expected behavior
+                    if (parsed?.code === 'PGRST116') return;
+                    logErrorToSlack(proxyRes.statusCode >= 500 ? 'error' : 'warning', {
+                        category: 'postgrest',
+                        action: `http.${proxyRes.statusCode}`,
+                        message: parsed?.message || `PostgREST ${proxyRes.statusCode} on ${req.method} ${req.originalUrl}`,
+                        module: 'rest-proxy',
+                        error_code: parsed?.code || String(proxyRes.statusCode),
+                        details: {
+                            method: req.method,
+                            url: req.originalUrl,
+                            status: proxyRes.statusCode,
+                            pgCode: parsed?.code,
+                            hint: parsed?.hint,
+                        },
+                    });
+                } catch { /* body not JSON or parse failed — skip */ }
+            });
+        }
+    },
     onError: (err, req, res) => {
         console.error('REST proxy error:', err.message);
+        logErrorToSlack('error', {
+            category: 'postgrest',
+            action: 'proxy.connection_error',
+            message: `REST proxy connection error: ${err.message}`,
+            module: 'rest-proxy',
+            details: { method: req.method, url: req.originalUrl },
+        });
         res.status(502).json({ error: 'REST service unavailable' });
     },
 }));
