@@ -36,7 +36,9 @@ async function getAccessToken(refreshToken, accountTable, emailField, emailValue
 // 📧 EMAIL WORKER — sends emails via Gmail API
 // =============================================
 new Worker('email', async (job) => {
-    const { agentId, to, subject, body: htmlBody, cc, bcc, inReplyTo, threadId, attachments } = job.data;
+    const { agentId, to, subject, body, bodyHtml, cc, bcc, inReplyTo, threadId, attachments } = job.data;
+    // Support both 'body' and 'bodyHtml' field names (frontend sends 'bodyHtml')
+    const htmlBody = bodyHtml || body;
     console.log(`📧 Sending email to ${to}...`);
 
     const { data: account } = await supabaseAdmin
@@ -84,7 +86,11 @@ async function sendGmail(accessToken, email, raw, threadId) {
 
 function buildRawEmail({ from, to, cc, bcc, subject, htmlBody, inReplyTo, attachments }) {
     const boundary = `boundary_${Date.now()}`;
-    let headers = `From: ${from}\r\nTo: ${to}\r\nSubject: ${subject}\r\nMIME-Version: 1.0\r\n`;
+    // RFC 2047 encode subject if it contains non-ASCII characters
+    const encodedSubject = /[^\x00-\x7F]/.test(subject)
+        ? `=?UTF-8?B?${Buffer.from(subject, 'utf-8').toString('base64')}?=`
+        : subject;
+    let headers = `From: ${from}\r\nTo: ${to}\r\nSubject: ${encodedSubject}\r\nMIME-Version: 1.0\r\n`;
     if (cc) headers += `Cc: ${cc}\r\n`;
     if (bcc) headers += `Bcc: ${bcc}\r\n`;
     if (inReplyTo) {
