@@ -38,7 +38,7 @@ async function getAccessToken(refreshToken, accountTable, emailField, emailValue
 new Worker('email', async (job) => {
     const { agentId, to, subject, body, bodyHtml, cc, bcc, inReplyTo, threadId, attachments } = job.data;
     // Support both 'body' and 'bodyHtml' field names (frontend sends 'bodyHtml')
-    const htmlBody = bodyHtml || body;
+    let htmlBody = bodyHtml || body;
     console.log(`📧 Sending email to ${to}...`);
 
     const { data: account } = await supabaseAdmin
@@ -48,6 +48,17 @@ new Worker('email', async (job) => {
         .single();
 
     if (!account) throw new Error(`No Gmail account for agent ${agentId}`);
+
+    // Fetch agent's email signature image
+    const { data: agentProfile } = await supabaseAdmin
+        .from('profiles')
+        .select('signature_image_url')
+        .eq('id', agentId)
+        .single();
+
+    if (agentProfile?.signature_image_url) {
+        htmlBody += `<div style="margin-top:24px; padding-top:16px; border-top:1px solid #e5e7eb;"><img src="${agentProfile.signature_image_url}" alt="Firma" style="max-width:500px; height:auto; display:block;" /></div>`;
+    }
 
     let accessToken = account.access_token;
     // Try to send, refresh token if needed

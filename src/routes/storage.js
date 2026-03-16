@@ -140,24 +140,66 @@ router.get('/object/:bucket/*', authMiddleware, async (req, res) => {
     }
 });
 
+// Helper: extract file from request (handles both multipart FormData and raw body)
+function extractFileFromRequest(req) {
+    return new Promise((resolve, reject) => {
+        const contentType = req.headers['content-type'] || '';
+
+        if (contentType.includes('multipart/form-data')) {
+            // Supabase JS sends files as FormData
+            const Busboy = require('busboy');
+            const bb = Busboy({ headers: req.headers });
+            let fileBuffer = null;
+            let fileMimeType = 'application/octet-stream';
+
+            bb.on('file', (name, file, info) => {
+                fileMimeType = info.mimeType || 'application/octet-stream';
+                const chunks = [];
+                file.on('data', (data) => chunks.push(data));
+                file.on('end', () => {
+                    fileBuffer = Buffer.concat(chunks);
+                });
+            });
+
+            bb.on('finish', () => {
+                resolve({ body: fileBuffer, mimeType: fileMimeType });
+            });
+
+            bb.on('error', reject);
+            req.pipe(bb);
+        } else {
+            // Raw binary body
+            const chunks = [];
+            req.on('data', (chunk) => chunks.push(chunk));
+            req.on('end', () => {
+                resolve({
+                    body: Buffer.concat(chunks),
+                    mimeType: contentType || 'application/octet-stream'
+                });
+            });
+            req.on('error', reject);
+        }
+    });
+}
+
 // POST /storage/v1/object/:bucket/*path — Upload file (Supabase-compatible)
 router.post('/object/:bucket/*', authMiddleware, async (req, res) => {
     try {
         const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
 
-        // Collect raw body
-        const chunks = [];
-        for await (const chunk of req) {
-            chunks.push(chunk);
+        const { body, mimeType } = await extractFileFromRequest(req);
+        console.log(`[Storage] Upload: bucket=${bucket}, key=${key}, size=${body?.length}, type=${mimeType}`);
+
+        if (!body || body.length === 0) {
+            return res.status(400).json({ error: 'Empty file body' });
         }
-        const body = Buffer.concat(chunks);
 
         await s3.send(new PutObjectCommand({
             Bucket: bucket,
             Key: key,
             Body: body,
-            ContentType: req.headers['content-type'] || 'application/octet-stream',
+            ContentType: mimeType,
         }));
 
         res.json({ Key: `${bucket}/${key}`, Id: key });
@@ -173,17 +215,17 @@ router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
         const bucket = normalizeBucket(req.params.bucket);
         const key = req.params[0];
 
-        const chunks = [];
-        for await (const chunk of req) {
-            chunks.push(chunk);
+        const { body, mimeType } = await extractFileFromRequest(req);
+
+        if (!body || body.length === 0) {
+            return res.status(400).json({ error: 'Empty file body' });
         }
-        const body = Buffer.concat(chunks);
 
         await s3.send(new PutObjectCommand({
             Bucket: bucket,
             Key: key,
             Body: body,
-            ContentType: req.headers['content-type'] || 'application/octet-stream',
+            ContentType: mimeType,
         }));
 
         res.json({ Key: `${bucket}/${key}`, Id: key });
