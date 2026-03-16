@@ -57,7 +57,8 @@ new Worker('email', async (job) => {
         .single();
 
     if (agentProfile?.signature_image_url) {
-        htmlBody += `<div style="margin-top:24px; padding-top:16px; border-top:1px solid #e5e7eb;"><img src="${agentProfile.signature_image_url}" alt="Firma" style="max-width:500px; height:auto; display:block;" /></div>`;
+        // Wrap body + signature in a single container so Gmail doesn't insert a separator line
+        htmlBody = `<div>${htmlBody}<img src="${agentProfile.signature_image_url}" alt="Firma" style="width:100%; max-width:500px; height:auto; display:block; margin-top:24px;" /></div>`;
     }
 
     let accessToken = account.access_token;
