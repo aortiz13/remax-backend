@@ -402,12 +402,320 @@ new Worker('tts', async (job) => {
 }, { connection: redisConnection, concurrency: 2 });
 
 // =============================================
-// 📦 IMPORT WORKER — import RE/MAX listings
+// 📦 IMPORT WORKER — RE/MAX listings sync
+// Handles:
+//   - 'sync-remax-listings': cron job that syncs ALL agents
+//   - 'import-remax-listings': single agent (legacy, unused but kept)
 // =============================================
 new Worker('import', async (job) => {
-    const { officeId, agentMlsId, triggeredBy } = job.data;
-    console.log(`📦 Importing RE/MAX listings for office ${officeId}...`);
-    // TODO: Port import-remax-listings Edge Function logic
+    const { scanAgentListings } = await import('./services/remaxListingsService.js');
+
+    if (job.name === 'sync-remax-listings') {
+        console.log('📦 Starting RE/MAX listings sync for all agents...');
+
+        // Fetch all agents with remax_agent_id
+        const { data: agents, error: agentErr } = await supabaseAdmin
+            .from('profiles')
+            .select('id, first_name, last_name, remax_agent_id')
+            .not('remax_agent_id', 'is', null);
+
+        if (agentErr || !agents?.length) {
+            console.log('📦 No agents with remax_agent_id found, skipping sync');
+            return;
+        }
+
+        console.log(`📦 Syncing ${agents.length} agents...`);
+        let totalSynced = 0;
+        let totalErrors = 0;
+
+        for (const agent of agents) {
+            try {
+                const { properties } = await scanAgentListings(agent.remax_agent_id);
+                if (!properties || properties.length === 0) {
+                    console.log(`  → ${agent.first_name} ${agent.last_name}: 0 properties`);
+                    continue;
+                }
+
+                // Fetch existing properties for this agent
+                const { data: existingProps } = await supabaseAdmin
+                    .from('properties')
+                    .select('id, listing_reference, listing_link, source, rol_number, address, commune, property_type, operation_type, price, currency, bedrooms, bathrooms, m2_total, m2_built, listing_link, latitude, longitude, image_url, published_at, last_updated_at, expires_at, sold_at, sold_price, is_exclusive, year_built, maintenance_fee, virtual_tour_url, video_url, parking_spaces, floor_number')
+                    .eq('agent_id', agent.id);
+
+                const existingByRef = {};
+                const existingRemaxIds = [];
+                for (const ep of (existingProps || [])) {
+                    if (ep.listing_reference?.trim()) {
+                        existingByRef[ep.listing_reference.trim()] = ep;
+                    }
+                    if (ep.rol_number?.trim()) {
+                        existingByRef[ep.rol_number.trim()] = ep;
+                    }
+                    if (ep.source === 'remax' && !ep.rol_number) {
+                        existingRemaxIds.push(ep.id);
+                    }
+                }
+
+                const toMerge = [];
+                const toInsert = [];
+
+                for (const p of properties) {
+                    const ref = p.listing_reference?.trim();
+                    if (ref && existingByRef[ref]) {
+                        toMerge.push({ existing: existingByRef[ref], incoming: p });
+                    } else {
+                        toInsert.push(p);
+                    }
+                }
+
+                // Merge matched properties (fill empty fields only)
+                for (const { existing, incoming } of toMerge) {
+                    const update = {};
+                    const isEmpty = (val) => val === null || val === undefined || val === '' || val === 0;
+
+                    const fillIfEmpty = {
+                        address: incoming.address,
+                        commune: incoming.commune,
+                        property_type: incoming.property_type,
+                        operation_type: incoming.operation_type,
+                        price: incoming.price,
+                        currency: incoming.currency,
+                        bedrooms: incoming.bedrooms,
+                        bathrooms: incoming.bathrooms,
+                        m2_total: incoming.m2_total,
+                        m2_built: incoming.m2_built,
+                        listing_link: incoming.source_url,
+                        latitude: incoming.latitude,
+                        longitude: incoming.longitude,
+                        image_url: incoming.image_url,
+                        published_at: incoming.published_at,
+                        last_updated_at: incoming.last_updated_at,
+                        expires_at: incoming.expires_at,
+                        sold_at: incoming.sold_at,
+                        sold_price: incoming.sold_price,
+                        is_exclusive: incoming.is_exclusive,
+                        year_built: incoming.year_built,
+                        maintenance_fee: incoming.maintenance_fee,
+                        virtual_tour_url: incoming.virtual_tour_url,
+                        video_url: incoming.video_url,
+                        parking_spaces: incoming.parking_spaces ? String(incoming.parking_spaces) : null,
+                        floor_number: incoming.floor_number ? String(incoming.floor_number) : null,
+                    };
+
+                    for (const [key, newVal] of Object.entries(fillIfEmpty)) {
+                        if (isEmpty(existing[key]) && !isEmpty(newVal)) {
+                            update[key] = newVal;
+                        }
+                    }
+
+                    // Always update RE/MAX identifiers
+                    update.listing_reference = incoming.listing_reference;
+                    update.remax_listing_id = incoming.listing_id;
+                    update.listing_status_uid = incoming.listing_status_uid;
+                    update.transaction_type_uid = incoming.transaction_type_uid;
+                    update.source = 'remax';
+                    update.updated_at = new Date().toISOString();
+
+                    if (!existing.rol_number && incoming.listing_reference) {
+                        update.rol_number = incoming.listing_reference;
+                    }
+
+                    await supabaseAdmin.from('properties').update(update).eq('id', existing.id);
+
+                    // Sync photos
+                    if (incoming.image_urls?.length > 0) {
+                        await supabaseAdmin.from('property_photos').delete()
+                            .eq('property_id', existing.id).eq('source', 'remax');
+
+                        const photoRecords = incoming.image_urls.map(img => ({
+                            property_id: existing.id,
+                            agent_id: agent.id,
+                            url: img.url,
+                            caption: img.caption || `Foto ${img.position + 1}`,
+                            position: img.position,
+                            source: 'remax',
+                        }));
+                        await supabaseAdmin.from('property_photos').insert(photoRecords);
+                    }
+
+                    // Sync history
+                    if (incoming.history?.length > 0) {
+                        for (const h of incoming.history) {
+                            const { data: existingH } = await supabaseAdmin
+                                .from('property_listing_history')
+                                .select('id')
+                                .eq('property_id', existing.id)
+                                .eq('remax_listing_id', String(h.listing_id))
+                                .maybeSingle();
+
+                            if (!existingH) {
+                                await supabaseAdmin.from('property_listing_history').insert({
+                                    property_id: existing.id,
+                                    listing_reference: incoming.listing_reference,
+                                    remax_listing_id: h.listing_id,
+                                    published_at: h.published_at,
+                                    expired_at: h.expires_at,
+                                    price: h.price,
+                                    currency: h.currency,
+                                    listing_status_uid: h.listing_status_uid,
+                                    status_label: h.status_label,
+                                    agent_id: agent.id,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Delete orphaned pure-remax properties (not matched)
+                const matchedIds = new Set(toMerge.map(m => m.existing.id));
+                const idsToDelete = existingRemaxIds.filter(id => !matchedIds.has(id));
+                if (idsToDelete.length > 0) {
+                    await supabaseAdmin.from('mandates').update({ property_id: null }).in('property_id', idsToDelete);
+                    await supabaseAdmin.from('crm_tasks').delete().in('property_id', idsToDelete);
+                    await supabaseAdmin.from('crm_actions').delete().in('property_id', idsToDelete);
+                    await supabaseAdmin.from('property_listing_history').delete().in('property_id', idsToDelete);
+                    await supabaseAdmin.from('properties').delete().in('id', idsToDelete);
+                }
+
+                // Insert NEW properties
+                if (toInsert.length > 0) {
+                    const dbProperties = toInsert.map(p => ({
+                        address: p.address,
+                        commune: p.commune,
+                        property_type: p.property_type,
+                        operation_type: p.operation_type,
+                        price: p.price || 0,
+                        currency: p.currency || 'CLP',
+                        bedrooms: p.bedrooms,
+                        bathrooms: p.bathrooms,
+                        m2_total: p.m2_total,
+                        m2_built: p.m2_built,
+                        notes: p.description,
+                        listing_link: p.source_url,
+                        latitude: p.latitude,
+                        longitude: p.longitude,
+                        status: p.status || ['Publicada'],
+                        source: 'remax',
+                        agent_id: agent.id,
+                        image_url: p.image_url,
+                        published_at: p.published_at,
+                        last_updated_at: p.last_updated_at,
+                        expires_at: p.expires_at,
+                        sold_at: p.sold_at,
+                        sold_price: p.sold_price,
+                        listing_status_uid: p.listing_status_uid,
+                        listing_reference: p.listing_reference,
+                        rol_number: p.listing_reference,
+                        remax_listing_id: p.listing_id,
+                        transaction_type_uid: p.transaction_type_uid,
+                        is_exclusive: p.is_exclusive || false,
+                        year_built: p.year_built,
+                        maintenance_fee: p.maintenance_fee,
+                        virtual_tour_url: p.virtual_tour_url,
+                        video_url: p.video_url,
+                        parking_spaces: String(p.parking_spaces || ''),
+                        floor_number: String(p.floor_number || ''),
+                    }));
+
+                    const { data: insertedProps, error: insertErr } = await supabaseAdmin
+                        .from('properties')
+                        .insert(dbProperties)
+                        .select('id, listing_reference, agent_id');
+
+                    if (insertErr) {
+                        console.error(`  ❌ Insert error for ${agent.first_name}: ${insertErr.message}`);
+                    } else if (insertedProps) {
+                        // Insert history & photos for new properties
+                        for (const inserted of insertedProps) {
+                            const original = toInsert.find(p => p.listing_reference === inserted.listing_reference);
+                            if (original?.history?.length > 0) {
+                                const historyRecords = original.history.map(h => ({
+                                    property_id: inserted.id,
+                                    listing_reference: inserted.listing_reference,
+                                    remax_listing_id: h.listing_id,
+                                    published_at: h.published_at,
+                                    expired_at: h.expires_at,
+                                    price: h.price,
+                                    currency: h.currency,
+                                    listing_status_uid: h.listing_status_uid,
+                                    status_label: h.status_label,
+                                    agent_id: inserted.agent_id,
+                                }));
+                                await supabaseAdmin.from('property_listing_history').insert(historyRecords);
+                            }
+
+                            if (original?.image_urls?.length > 0) {
+                                const photoRecords = original.image_urls.map(img => ({
+                                    property_id: inserted.id,
+                                    agent_id: inserted.agent_id,
+                                    url: img.url,
+                                    caption: img.caption || `Foto ${img.position + 1}`,
+                                    position: img.position,
+                                    source: 'remax',
+                                }));
+                                await supabaseAdmin.from('property_photos').insert(photoRecords);
+                            }
+                        }
+                    }
+                }
+
+                // Update KPI
+                const INACTIVE_STATUSES = ['Vendida', 'Retirada', 'Pausada', 'Arrendada'];
+                const todayStr = new Date().toISOString().split('T')[0];
+                const activeCount = properties.filter(p =>
+                    !(p.status || []).some(s => INACTIVE_STATUSES.includes(s))
+                ).length;
+
+                if (activeCount > 0) {
+                    const { data: existingKpi } = await supabaseAdmin
+                        .from('kpi_records')
+                        .select('id')
+                        .eq('agent_id', agent.id)
+                        .eq('period_type', 'daily')
+                        .eq('date', todayStr)
+                        .maybeSingle();
+
+                    if (existingKpi) {
+                        await supabaseAdmin.from('kpi_records')
+                            .update({ active_portfolio: activeCount })
+                            .eq('id', existingKpi.id);
+                    } else {
+                        await supabaseAdmin.from('kpi_records').insert({
+                            agent_id: agent.id, period_type: 'daily', date: todayStr,
+                            active_portfolio: activeCount,
+                            new_listings: 0, conversations_started: 0, relational_coffees: 0,
+                            sales_interviews: 0, buying_interviews: 0, commercial_evaluations: 0,
+                            price_reductions: 0, portfolio_visits: 0, buyer_visits: 0,
+                            offers_in_negotiation: 0, signed_promises: 0,
+                            billing_primary: 0, referrals_count: 0, billing_secondary: 0,
+                        });
+                    }
+                }
+
+                const syncedCount = toMerge.length + toInsert.length;
+                totalSynced += syncedCount;
+                console.log(`  ✅ ${agent.first_name} ${agent.last_name}: ${syncedCount} properties (${toMerge.length} merged, ${toInsert.length} new, ${idsToDelete.length} removed)`);
+
+            } catch (agentError) {
+                totalErrors++;
+                console.error(`  ❌ Error syncing agent ${agent.first_name} ${agent.last_name}:`, agentError.message);
+                const { logErrorToSlack } = await import('./middleware/slackErrorLogger.js');
+                logErrorToSlack('error', {
+                    category: 'cron',
+                    action: 'sync_remax_listings',
+                    message: `Error scanning agent ${agent.first_name} ${agent.last_name} (${agent.remax_agent_id}): ${agentError.message}`,
+                    module: 'import-worker',
+                });
+            }
+        }
+
+        console.log(`📦 RE/MAX sync complete: ${totalSynced} properties synced, ${totalErrors} errors`);
+
+    } else {
+        // Legacy single-agent job (unused but kept for compatibility)
+        const { agentId, triggeredBy } = job.data;
+        console.log(`📦 Import worker job received for agent ${agentId} (triggered by ${triggeredBy})`);
+    }
 }, { connection: redisConnection, concurrency: 1 });
 
 // Start cron jobs
