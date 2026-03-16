@@ -11,6 +11,27 @@ const getVal = (obj, key) => {
     return foundKey ? obj[foundKey] : undefined;
 };
 
+// Helper: parse date from RE/MAX API (handles ISO strings, Unix timestamps, and epoch ms)
+const parseDate = (val) => {
+    if (!val) return null;
+    if (typeof val === 'string') {
+        // Already ISO string
+        if (val.includes('T') || val.includes('-')) return val;
+        // Numeric string
+        val = Number(val);
+    }
+    if (typeof val === 'number') {
+        // Unix timestamp in seconds (< 10 billion) vs milliseconds
+        const ms = val < 1e11 ? val * 1000 : val;
+        try {
+            return new Date(ms).toISOString();
+        } catch {
+            return null;
+        }
+    }
+    return null;
+};
+
 /**
  * Search RE/MAX listings API
  * @param {string} filter - OData filter string
@@ -116,10 +137,10 @@ export function parseListing(item, agentId) {
     const isExclusive = getVal(p, 'IsExclusive') || false;
 
     // Dates
-    const publishedAt = getVal(p, 'ListingDate') || getVal(p, 'PublishedDate') || null;
-    const expiresAt = getVal(p, 'ExpirationDate') || null;
-    const lastUpdatedAt = getVal(p, 'ModifiedDate') || getVal(p, 'LastModifiedDate') || null;
-    const soldAt = getVal(p, 'SoldDate') || getVal(p, 'ClosedDate') || null;
+    const publishedAt = parseDate(getVal(p, 'ListingDate') || getVal(p, 'PublishedDate'));
+    const expiresAt = parseDate(getVal(p, 'ExpirationDate'));
+    const lastUpdatedAt = parseDate(getVal(p, 'ModifiedDate') || getVal(p, 'LastModifiedDate'));
+    const soldAt = parseDate(getVal(p, 'SoldDate') || getVal(p, 'ClosedDate'));
     const soldPrice = getVal(p, 'SoldPrice') || getVal(p, 'ClosedPrice') || null;
 
     // Virtual tour & video

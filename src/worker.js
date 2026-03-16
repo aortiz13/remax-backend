@@ -366,7 +366,12 @@ new Worker('slack-alert', async (job) => {
 
     const timestamp = new Date().toLocaleString('es-CL', { timeZone: 'America/Santiago' });
 
-    await fetch(SLACK_WEBHOOK_URL, {
+    if (!SLACK_WEBHOOK_URL) {
+        console.error('🔔 ❌ SLACK_WEBHOOK_URL not configured — skipping Slack alert');
+        return;
+    }
+
+    const slackRes = await fetch(SLACK_WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -381,7 +386,14 @@ new Worker('slack-alert', async (job) => {
             }],
         }),
     });
-    console.log(`🔔 Slack alert sent: ${level} - ${message}`);
+
+    if (!slackRes.ok) {
+        const errBody = await slackRes.text().catch(() => '');
+        console.error(`🔔 ❌ Slack webhook failed: HTTP ${slackRes.status} — ${errBody}`);
+        throw new Error(`Slack webhook returned ${slackRes.status}: ${errBody}`);
+    }
+
+    console.log(`🔔 ✅ Slack alert sent: ${level} - ${message}`);
 }, { connection: redisConnection, concurrency: 2 });
 
 // =============================================
