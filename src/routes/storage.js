@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import express from 'express';
 import crypto from 'crypto';
+import Busboy from 'busboy';
 import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import authMiddleware from '../middleware/auth.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
@@ -157,7 +158,6 @@ function extractFileFromRequest(req) {
 
         if (contentType.includes('multipart/form-data')) {
             // Supabase JS sends files as FormData
-            const Busboy = require('busboy');
             const bb = Busboy({ headers: req.headers });
             let fileBuffer = null;
             let fileMimeType = 'application/octet-stream';
