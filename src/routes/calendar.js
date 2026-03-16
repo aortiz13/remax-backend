@@ -2,6 +2,7 @@ import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { calendarQueue } from '../queues/index.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
 
@@ -325,7 +326,10 @@ router.post('/sync', authMiddleware, async (req, res) => {
 
         res.status(404).json({ error: 'Action not found' });
     } catch (error) {
-        console.error('Calendar sync error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'calendar.sync', message: error.message,
+            module: 'calendar', details: { action: req.body?.action },
+        });
         res.status(400).json({ error: error.message });
     }
 });

@@ -3,6 +3,7 @@ import express from 'express';
 import crypto from 'crypto';
 import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 import authMiddleware from '../middleware/auth.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
 const jsonParser = express.json({ limit: '10mb' }); // Only for routes that need JSON body
@@ -53,7 +54,10 @@ router.post('/object/sign/:bucket/*', jsonParser, authMiddleware, async (req, re
 
         res.json({ signedURL });
     } catch (error) {
-        console.error('Storage sign error:', error.message);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'storage.sign', message: error.message,
+            module: 'storage',
+        });
         res.status(400).json({ error: error.message });
     }
 });
@@ -101,7 +105,10 @@ router.get('/object/sign/:bucket/*', async (req, res) => {
 
         response.Body.pipe(res);
     } catch (error) {
-        console.error('[Storage] Signed download error:', error.name, error.message, error.$metadata?.httpStatusCode);
+        logErrorToSlack('warning', {
+            category: 'backend', action: 'storage.signed_download', message: error.message,
+            module: 'storage',
+        });
         res.status(404).json({ error: 'File not found', details: error.message });
     }
 });
@@ -135,7 +142,10 @@ router.get('/object/:bucket/*', authMiddleware, async (req, res) => {
 
         response.Body.pipe(res);
     } catch (error) {
-        console.error('[Storage] Download error:', error.name, error.message);
+        logErrorToSlack('warning', {
+            category: 'backend', action: 'storage.download', message: error.message,
+            module: 'storage',
+        });
         res.status(404).json({ error: 'File not found', details: error.message });
     }
 });
@@ -204,7 +214,10 @@ router.post('/object/:bucket/*', authMiddleware, async (req, res) => {
 
         res.json({ Key: `${bucket}/${key}`, Id: key });
     } catch (error) {
-        console.error('Storage upload error:', error.message);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'storage.upload', message: error.message,
+            module: 'storage',
+        });
         res.status(400).json({ error: error.message });
     }
 });
@@ -230,7 +243,10 @@ router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
 
         res.json({ Key: `${bucket}/${key}`, Id: key });
     } catch (error) {
-        console.error('Storage update error:', error.message);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'storage.update', message: error.message,
+            module: 'storage',
+        });
         res.status(400).json({ error: error.message });
     }
 });
@@ -250,7 +266,10 @@ router.delete('/object/:bucket', jsonParser, authMiddleware, async (req, res) =>
 
         res.json([]);
     } catch (error) {
-        console.error('Storage delete error:', error.message);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'storage.delete', message: error.message,
+            module: 'storage',
+        });
         res.status(400).json({ error: error.message });
     }
 });
@@ -268,7 +287,10 @@ router.get('/object/public/:bucket/*', async (req, res) => {
 
         response.Body.pipe(res);
     } catch (error) {
-        console.error('Storage public download error:', error.message);
+        logErrorToSlack('warning', {
+            category: 'backend', action: 'storage.public_download', message: error.message,
+            module: 'storage',
+        });
         res.status(404).json({ error: 'File not found' });
     }
 });
@@ -286,7 +308,10 @@ router.get('/object/authenticated/:bucket/*', authMiddleware, async (req, res) =
 
         response.Body.pipe(res);
     } catch (error) {
-        console.error('Storage auth download error:', error.message);
+        logErrorToSlack('warning', {
+            category: 'backend', action: 'storage.auth_download', message: error.message,
+            module: 'storage',
+        });
         res.status(404).json({ error: 'File not found' });
     }
 });

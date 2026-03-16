@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
 
@@ -46,7 +47,10 @@ router.post('/action', authMiddleware, async (req, res) => {
                 return res.status(400).json({ error: `Unknown action: ${action}` });
         }
     } catch (error) {
-        console.error('Admin action error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'admin.action', message: error.message,
+            module: 'admin', details: { body: req.body },
+        });
         res.status(400).json({ error: error.message });
     }
 });

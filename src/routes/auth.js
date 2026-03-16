@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
 
@@ -114,7 +115,10 @@ router.post('/google', authMiddleware, async (req, res) => {
 
         res.json({ success: true, access_token: tokens.access_token });
     } catch (error) {
-        console.error('Google auth error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'auth.google', message: error.message,
+            module: 'auth',
+        });
         res.status(400).json({ error: error.message });
     }
 });

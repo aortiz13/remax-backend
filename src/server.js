@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import pool from './lib/db.js';
 import redis from './lib/redis.js';
+import { logErrorToSlack } from './middleware/slackErrorLogger.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -180,6 +181,13 @@ app.all('/functions/v1/:functionName', (req, res) => {
 // Global error handler
 app.use((err, req, res, next) => {
     console.error('❌ Unhandled error:', err);
+    logErrorToSlack('error', {
+        category: 'backend',
+        action: 'unhandled_error',
+        message: err.message || 'Unknown error',
+        module: `${req.method} ${req.originalUrl}`,
+        details: { stack: err.stack?.substring(0, 500) },
+    });
     res.status(500).json({ error: 'Internal server error' });
 });
 

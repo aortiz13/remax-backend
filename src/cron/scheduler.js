@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { calendarQueue, importQueue, youtubeQueue, cameraReminderQueue, cleanupQueue } from '../queues/index.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 export function startCronJobs() {
     // Calendar sync — every 15 minutes
@@ -60,7 +61,7 @@ export function startCronJobs() {
                 .lte('due_date', new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0])
                 .gte('due_date', new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0]);
 
-            if (error) { console.error('❌ Report task cron query error:', error.message); return; }
+            if (error) { logErrorToSlack('error', { category: 'cron', action: 'report_task.query', message: error.message, module: 'scheduler' }); return; }
             if (!reports || reports.length === 0) { console.log('✅ No pending reports need tasks'); return; }
 
             // Check for existing tasks to avoid duplicates
@@ -97,13 +98,119 @@ export function startCronJobs() {
 
             if (newTasks.length > 0) {
                 const { error: insertError } = await supabaseAdmin.from('crm_tasks').insert(newTasks);
-                if (insertError) console.error('❌ Error inserting report tasks:', insertError.message);
+                if (insertError) logErrorToSlack('error', { category: 'cron', action: 'report_task.insert', message: insertError.message, module: 'scheduler' });
                 else console.log(`✅ Created ${newTasks.length} management report task(s)`);
             } else {
                 console.log('✅ All pending reports already have tasks');
             }
         } catch (err) {
-            console.error('❌ Management report task cron error:', err.message);
+            logErrorToSlack('error', { category: 'cron', action: 'report_task.exception', message: err.message, module: 'scheduler' });
+        }
+    });
+
+    // Inspection reminders — daily at 8am (Chile time UTC-3 = 11:00 UTC)
+    cron.schedule('0 11 * * *', async () => {
+        console.log('⏰ Cron: Inspection reminders check');
+        try {
+            const today = new Date().toISOString().split('T')[0];
+            const in3Days = new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0];
+
+            // Find pending inspections scheduled within next 3 days, not yet notified
+            const { data: schedules, error } = await supabaseAdmin
+                .from('inspection_schedule')
+                .select(`
+                    id, scheduled_date, property_id, agent_id, notification_sent,
+                    property:properties(id, address, commune),
+                    agent:profiles(id, first_name, last_name, email, phone)
+                `)
+                .eq('status', 'pending')
+                .gte('scheduled_date', today)
+                .lte('scheduled_date', in3Days)
+                .or('notification_sent.is.null,notification_sent.eq.false');
+
+            if (error) { logErrorToSlack('error', { category: 'cron', action: 'inspection_reminder.query', message: error.message, module: 'scheduler' }); return; }
+            if (!schedules || schedules.length === 0) { console.log('✅ No upcoming inspections need reminders'); return; }
+
+            // Check for existing CRM tasks to avoid duplicates
+            const agentIds = [...new Set(schedules.map(s => s.agent_id).filter(Boolean))];
+            const { data: existingTasks } = await supabaseAdmin
+                .from('crm_tasks')
+                .select('description')
+                .in('agent_id', agentIds)
+                .eq('task_type', 'task')
+                .eq('completed', false)
+                .like('action', 'Inspección Programada%');
+
+            const existingKeys = new Set((existingTasks || []).map(t => t.description));
+
+            const newTasks = [];
+            const notifiedIds = [];
+
+            for (const s of schedules) {
+                if (!s.agent_id || !s.agent) continue;
+
+                const taskKey = `inspection:${s.id}`;
+                const addr = s.property?.address || 'Propiedad';
+                const commune = s.property?.commune ? `, ${s.property.commune}` : '';
+
+                // Create CRM task if not exists
+                if (!existingKeys.has(taskKey)) {
+                    newTasks.push({
+                        agent_id: s.agent_id,
+                        property_id: s.property_id,
+                        action: `Inspección Programada - ${addr}${commune}`,
+                        description: taskKey,
+                        task_type: 'task',
+                        execution_date: `${s.scheduled_date}T09:00:00-03:00`,
+                        is_all_day: true,
+                        completed: false,
+                    });
+                }
+
+                // Send notification via n8n webhook
+                try {
+                    await fetch('https://workflow.remax-exclusive.cl/webhook/inspection-reminder', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            event: 'inspection_reminder',
+                            agent: {
+                                name: `${s.agent.first_name || ''} ${s.agent.last_name || ''}`.trim(),
+                                email: s.agent.email || '',
+                                phone: s.agent.phone || '',
+                            },
+                            inspection: {
+                                schedule_id: s.id,
+                                property_id: s.property_id,
+                                address: `${addr}${commune}`,
+                                scheduled_date: s.scheduled_date,
+                            },
+                        }),
+                    });
+                } catch (webhookErr) {
+                    console.warn(`⚠️ Inspection reminder webhook failed for ${s.id}:`, webhookErr.message);
+                }
+
+                notifiedIds.push(s.id);
+            }
+
+            // Insert CRM tasks
+            if (newTasks.length > 0) {
+                const { error: insertError } = await supabaseAdmin.from('crm_tasks').insert(newTasks);
+                if (insertError) logErrorToSlack('error', { category: 'cron', action: 'inspection_task.insert', message: insertError.message, module: 'scheduler' });
+                else console.log(`✅ Created ${newTasks.length} inspection reminder task(s)`);
+            }
+
+            // Mark as notified
+            if (notifiedIds.length > 0) {
+                await supabaseAdmin
+                    .from('inspection_schedule')
+                    .update({ notification_sent: true })
+                    .in('id', notifiedIds);
+                console.log(`✅ Marked ${notifiedIds.length} inspections as notified`);
+            }
+        } catch (err) {
+            logErrorToSlack('error', { category: 'cron', action: 'inspection_reminder.exception', message: err.message, module: 'scheduler' });
         }
     });
 

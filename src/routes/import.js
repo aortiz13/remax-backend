@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import { importQueue } from '../queues/index.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
 
@@ -20,7 +21,10 @@ router.post('/remax-listings', authMiddleware, async (req, res) => {
 
         res.json({ success: true, message: 'Import job queued' });
     } catch (error) {
-        console.error('Import error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'import.remax_listings', message: error.message,
+            module: 'import',
+        });
         res.status(400).json({ error: error.message });
     }
 });

@@ -2,6 +2,7 @@ import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import pool from '../lib/db.js';
 import { emailQueue } from '../queues/index.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
 
@@ -30,6 +31,10 @@ const handleAuthUrl = async (req, res) => {
 
         res.json({ url: url.toString() });
     } catch (error) {
+        logErrorToSlack('error', {
+            category: 'backend', action: 'gmail.auth_url', message: error.message,
+            module: 'gmail',
+        });
         res.status(400).json({ error: error.message });
     }
 };
@@ -120,7 +125,10 @@ router.get('/callback', async (req, res) => {
         const frontendUrl = process.env.FRONTEND_URL || 'https://solicitudes.remax-exclusive.cl';
         res.redirect(`${frontendUrl}/casilla?gmail=connected`);
     } catch (error) {
-        console.error('[Gmail] Callback error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'gmail.callback', message: error.message,
+            module: 'gmail',
+        });
         const frontendUrl = process.env.FRONTEND_URL || 'https://solicitudes.remax-exclusive.cl';
         res.redirect(`${frontendUrl}/casilla?gmail=error&msg=${encodeURIComponent(error.message)}`);
     }
@@ -138,7 +146,10 @@ router.post('/callback', authMiddleware, async (req, res) => {
         const result = await processGmailCallback(code, agentId);
         res.json(result);
     } catch (error) {
-        console.error('[Gmail] Callback error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'gmail.callback_post', message: error.message,
+            module: 'gmail',
+        });
         res.status(400).json({ error: error.message });
     }
 });
@@ -159,7 +170,10 @@ router.post('/send', authMiddleware, async (req, res) => {
 
         res.json({ success: true, message: 'Email queued for sending' });
     } catch (error) {
-        console.error('Gmail send error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'gmail.send', message: error.message,
+            module: 'gmail',
+        });
         res.status(400).json({ error: error.message });
     }
 });

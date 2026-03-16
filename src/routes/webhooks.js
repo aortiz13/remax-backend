@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { gmailWebhookQueue, calendarQueue } from '../queues/index.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
 
@@ -50,7 +51,10 @@ router.post('/gmail', async (req, res) => {
 
         res.status(200).send('OK');
     } catch (error) {
-        console.error('Gmail webhook error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'webhook.gmail', message: error.message,
+            module: 'webhooks',
+        });
         res.status(200).send('OK - Error logged');
     }
 });
@@ -82,7 +86,10 @@ router.post('/calendar', async (req, res) => {
 
         res.status(200).send('ok');
     } catch (error) {
-        console.error('Calendar webhook error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'webhook.calendar', message: error.message,
+            module: 'webhooks',
+        });
         res.status(200).send('ok');
     }
 });

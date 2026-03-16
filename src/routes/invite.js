@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
+import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
 
@@ -35,7 +36,10 @@ router.post('/agent', authMiddleware, async (req, res) => {
         if (error) throw error;
         res.json(data);
     } catch (error) {
-        console.error('Invite agent error:', error);
+        logErrorToSlack('error', {
+            category: 'backend', action: 'invite.agent', message: error.message,
+            module: 'invite', details: { email: req.body?.email },
+        });
         res.status(400).json({ error: error.message });
     }
 });
