@@ -60,6 +60,38 @@ function verifySignToken(bucket, key, expiresAt, token) {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(token)) && Date.now() < expiresAt;
 }
 
+// POST /storage/v1/object/sign/:bucket — Batch create signed URLs (Supabase createSignedUrls)
+// This MUST come before the single-path route so Express matches it first
+router.post('/object/sign/:bucket', jsonParser, authMiddleware, async (req, res) => {
+    try {
+        const bucket = normalizeBucket(req.params.bucket);
+        const { paths, expiresIn = 3600 } = req.body || {};
+
+        if (!Array.isArray(paths) || paths.length === 0) {
+            return res.status(400).json({ error: 'paths array is required' });
+        }
+
+        const expiresAt = Date.now() + (expiresIn * 1000);
+        const results = paths.map(path => {
+            const token = createSignToken(bucket, path, expiresAt);
+            return {
+                path,
+                signedUrl: `/object/sign/${bucket}/${path}?token=${token}&expires=${expiresAt}`,
+                signedURL: `/object/sign/${bucket}/${path}?token=${token}&expires=${expiresAt}`,
+                error: null,
+            };
+        });
+
+        res.json(results);
+    } catch (error) {
+        logErrorToSlack('error', {
+            category: 'backend', action: 'storage.sign_batch', message: error.message,
+            module: 'storage',
+        });
+        res.status(400).json({ error: error.message });
+    }
+});
+
 // POST /storage/v1/object/sign/:bucket/*path — Create signed URLs (Supabase-compatible)
 router.post('/object/sign/:bucket/*', jsonParser, authMiddleware, async (req, res) => {
     try {
