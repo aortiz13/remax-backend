@@ -419,17 +419,29 @@ new Worker('tts', async (job) => {
 //   - 'sync-remax-listings': cron job that syncs ALL agents
 //   - 'import-remax-listings': single agent (legacy, unused but kept)
 // =============================================
+// Helper: convert Unix timestamps to ISO date strings (same as frontend safeDate)
+function safeDate(val) {
+    if (!val) return null;
+    if (typeof val === 'number' || (typeof val === 'string' && /^\d+$/.test(val))) {
+        const num = Number(val);
+        const ms = num < 1e11 ? num * 1000 : num;
+        try { return new Date(ms).toISOString(); } catch { return null; }
+    }
+    return val; // already a string date
+}
+
 new Worker('import', async (job) => {
     const { scanAgentListings } = await import('./services/remaxListingsService.js');
 
     if (job.name === 'sync-remax-listings') {
         console.log('📦 Starting RE/MAX listings sync for all agents...');
 
-        // Fetch all agents with remax_agent_id
+        // Fetch all agents with remax_agent_id (filter out empty strings)
         const { data: agents, error: agentErr } = await supabaseAdmin
             .from('profiles')
             .select('id, first_name, last_name, remax_agent_id')
-            .not('remax_agent_id', 'is', null);
+            .not('remax_agent_id', 'is', null)
+            .neq('remax_agent_id', '');
 
         if (agentErr || !agents?.length) {
             console.log('📦 No agents with remax_agent_id found, skipping sync');
@@ -448,26 +460,27 @@ new Worker('import', async (job) => {
                     continue;
                 }
 
-                // Fetch existing properties for this agent
+                // 1. Fetch ALL existing properties for this agent
                 const { data: existingProps } = await supabaseAdmin
                     .from('properties')
-                    .select('id, listing_reference, listing_link, source, rol_number, address, commune, property_type, operation_type, price, currency, bedrooms, bathrooms, m2_total, m2_built, listing_link, latitude, longitude, image_url, published_at, last_updated_at, expires_at, sold_at, sold_price, is_exclusive, year_built, maintenance_fee, virtual_tour_url, video_url, parking_spaces, floor_number')
+                    .select('id, rol_number, listing_reference, source, address, commune, property_type, operation_type, price, currency, bedrooms, bathrooms, m2_total, m2_built, notes, listing_link, latitude, longitude, image_url, published_at, last_updated_at, expires_at, sold_at, sold_price, is_exclusive, year_built, maintenance_fee, virtual_tour_url, video_url, parking_spaces, floor_number, status, owner_id, documentation_link, unit_number')
                     .eq('agent_id', agent.id);
 
                 const existingByRef = {};
                 const existingRemaxIds = [];
                 for (const ep of (existingProps || [])) {
-                    if (ep.listing_reference?.trim()) {
-                        existingByRef[ep.listing_reference.trim()] = ep;
-                    }
                     if (ep.rol_number?.trim()) {
                         existingByRef[ep.rol_number.trim()] = ep;
+                    }
+                    if (ep.listing_reference?.trim()) {
+                        existingByRef[ep.listing_reference.trim()] = ep;
                     }
                     if (ep.source === 'remax' && !ep.rol_number) {
                         existingRemaxIds.push(ep.id);
                     }
                 }
 
+                // 2. Separate: matched (ROL/ref exists) vs new (no match)
                 const toMerge = [];
                 const toInsert = [];
 
@@ -480,18 +493,18 @@ new Worker('import', async (job) => {
                     }
                 }
 
-                // Merge matched properties (fill empty fields only)
+                // 3. MERGE matched properties (only fill empty fields, never overwrite agent data)
                 for (const { existing, incoming } of toMerge) {
                     const update = {};
                     const isEmpty = (val) => val === null || val === undefined || val === '' || val === 0;
 
                     const fillIfEmpty = {
                         address: incoming.address,
-                        commune: incoming.commune,
+                        commune: incoming.commune || incoming.address?.split(',')[1]?.trim() || '',
                         property_type: incoming.property_type,
-                        operation_type: incoming.operation_type,
-                        price: incoming.price,
-                        currency: incoming.currency,
+                        operation_type: incoming.operation_type || 'venta',
+                        price: incoming.price || 0,
+                        currency: incoming.currency || 'CLP',
                         bedrooms: incoming.bedrooms,
                         bathrooms: incoming.bathrooms,
                         m2_total: incoming.m2_total,
@@ -500,12 +513,12 @@ new Worker('import', async (job) => {
                         latitude: incoming.latitude,
                         longitude: incoming.longitude,
                         image_url: incoming.image_url,
-                        published_at: incoming.published_at,
-                        last_updated_at: incoming.last_updated_at,
-                        expires_at: incoming.expires_at,
-                        sold_at: incoming.sold_at,
+                        published_at: safeDate(incoming.published_at),
+                        last_updated_at: safeDate(incoming.last_updated_at),
+                        expires_at: safeDate(incoming.expires_at),
+                        sold_at: safeDate(incoming.sold_at),
                         sold_price: incoming.sold_price,
-                        is_exclusive: incoming.is_exclusive,
+                        is_exclusive: incoming.is_exclusive || false,
                         year_built: incoming.year_built,
                         maintenance_fee: incoming.maintenance_fee,
                         virtual_tour_url: incoming.virtual_tour_url,
@@ -565,8 +578,8 @@ new Worker('import', async (job) => {
                                     property_id: existing.id,
                                     listing_reference: incoming.listing_reference,
                                     remax_listing_id: h.listing_id,
-                                    published_at: h.published_at,
-                                    expired_at: h.expires_at,
+                                    published_at: safeDate(h.published_at),
+                                    expired_at: safeDate(h.expires_at),
                                     price: h.price,
                                     currency: h.currency,
                                     listing_status_uid: h.listing_status_uid,
@@ -578,7 +591,7 @@ new Worker('import', async (job) => {
                     }
                 }
 
-                // Delete orphaned pure-remax properties (not matched)
+                // 4. Delete orphaned pure-remax properties (not matched)
                 const matchedIds = new Set(toMerge.map(m => m.existing.id));
                 const idsToDelete = existingRemaxIds.filter(id => !matchedIds.has(id));
                 if (idsToDelete.length > 0) {
@@ -586,16 +599,27 @@ new Worker('import', async (job) => {
                     await supabaseAdmin.from('crm_tasks').delete().in('property_id', idsToDelete);
                     await supabaseAdmin.from('crm_actions').delete().in('property_id', idsToDelete);
                     await supabaseAdmin.from('property_listing_history').delete().in('property_id', idsToDelete);
+                    await supabaseAdmin.from('property_import_log').delete().in('property_id', idsToDelete);
+                    await supabaseAdmin.from('property_photos').delete().in('property_id', idsToDelete);
                     await supabaseAdmin.from('properties').delete().in('id', idsToDelete);
                 }
 
-                // Insert NEW properties
+                // 5. Insert NEW properties
                 if (toInsert.length > 0) {
-                    const dbProperties = toInsert.map(p => ({
+                    // Deduplicate by listing_link to avoid unique constraint violation
+                    const seenLinks = new Set();
+                    const deduped = toInsert.filter(p => {
+                        const link = p.source_url || '';
+                        if (!link || seenLinks.has(link)) return false;
+                        seenLinks.add(link);
+                        return true;
+                    });
+
+                    const dbProperties = deduped.map(p => ({
                         address: p.address,
-                        commune: p.commune,
+                        commune: p.commune || p.address?.split(',')[1]?.trim() || '',
                         property_type: p.property_type,
-                        operation_type: p.operation_type,
+                        operation_type: p.operation_type || 'venta',
                         price: p.price || 0,
                         currency: p.currency || 'CLP',
                         bedrooms: p.bedrooms,
@@ -610,10 +634,10 @@ new Worker('import', async (job) => {
                         source: 'remax',
                         agent_id: agent.id,
                         image_url: p.image_url,
-                        published_at: p.published_at,
-                        last_updated_at: p.last_updated_at,
-                        expires_at: p.expires_at,
-                        sold_at: p.sold_at,
+                        published_at: safeDate(p.published_at),
+                        last_updated_at: safeDate(p.last_updated_at),
+                        expires_at: safeDate(p.expires_at),
+                        sold_at: safeDate(p.sold_at),
                         sold_price: p.sold_price,
                         listing_status_uid: p.listing_status_uid,
                         listing_reference: p.listing_reference,
@@ -638,43 +662,61 @@ new Worker('import', async (job) => {
                         console.error(`  ❌ Insert error for ${agent.first_name}: ${insertErr.message}`);
                     } else if (insertedProps) {
                         // Insert history & photos for new properties
+                        const historyRecords = [];
+                        const allPhotoRecords = [];
+
                         for (const inserted of insertedProps) {
                             const original = toInsert.find(p => p.listing_reference === inserted.listing_reference);
                             if (original?.history?.length > 0) {
-                                const historyRecords = original.history.map(h => ({
-                                    property_id: inserted.id,
-                                    listing_reference: inserted.listing_reference,
-                                    remax_listing_id: h.listing_id,
-                                    published_at: h.published_at,
-                                    expired_at: h.expires_at,
-                                    price: h.price,
-                                    currency: h.currency,
-                                    listing_status_uid: h.listing_status_uid,
-                                    status_label: h.status_label,
-                                    agent_id: inserted.agent_id,
-                                }));
-                                await supabaseAdmin.from('property_listing_history').insert(historyRecords);
+                                for (const h of original.history) {
+                                    historyRecords.push({
+                                        property_id: inserted.id,
+                                        listing_reference: inserted.listing_reference,
+                                        remax_listing_id: h.listing_id,
+                                        published_at: safeDate(h.published_at),
+                                        expired_at: safeDate(h.expires_at),
+                                        price: h.price,
+                                        currency: h.currency,
+                                        listing_status_uid: h.listing_status_uid,
+                                        status_label: h.status_label,
+                                        agent_id: inserted.agent_id,
+                                    });
+                                }
                             }
 
                             if (original?.image_urls?.length > 0) {
-                                const photoRecords = original.image_urls.map(img => ({
-                                    property_id: inserted.id,
-                                    agent_id: inserted.agent_id,
-                                    url: img.url,
-                                    caption: img.caption || `Foto ${img.position + 1}`,
-                                    position: img.position,
-                                    source: 'remax',
-                                }));
-                                await supabaseAdmin.from('property_photos').insert(photoRecords);
+                                for (const img of original.image_urls) {
+                                    allPhotoRecords.push({
+                                        property_id: inserted.id,
+                                        agent_id: inserted.agent_id,
+                                        url: img.url,
+                                        caption: img.caption || `Foto ${img.position + 1}`,
+                                        position: img.position,
+                                        source: 'remax',
+                                    });
+                                }
                             }
+                        }
+
+                        if (historyRecords.length > 0) {
+                            const { error: histErr } = await supabaseAdmin
+                                .from('property_listing_history').insert(historyRecords);
+                            if (histErr) console.error(`  ⚠️ History insert error: ${histErr.message}`);
+                        }
+
+                        if (allPhotoRecords.length > 0) {
+                            const { error: photoErr } = await supabaseAdmin
+                                .from('property_photos').insert(allPhotoRecords);
+                            if (photoErr) console.error(`  ⚠️ Photo insert error: ${photoErr.message}`);
                         }
                     }
                 }
 
-                // Update KPI
+                // 6. Update KPI
                 const INACTIVE_STATUSES = ['Vendida', 'Retirada', 'Pausada', 'Arrendada'];
                 const todayStr = new Date().toISOString().split('T')[0];
-                const activeCount = properties.filter(p =>
+                const allAgentProps = [...toInsert, ...toMerge.map(m => m.incoming)];
+                const activeCount = allAgentProps.filter(p =>
                     !(p.status || []).some(s => INACTIVE_STATUSES.includes(s))
                 ).length;
 
