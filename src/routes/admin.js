@@ -17,7 +17,7 @@ router.post('/action', authMiddleware, async (req, res) => {
             .eq('id', adminId)
             .single();
 
-        if (!adminProfile || !['admin', 'superadministrador'].includes(adminProfile.role)) {
+        if (!adminProfile || !['admin', 'superadministrador', 'comercial', 'legal', 'tecnico'].includes(adminProfile.role)) {
             return res.status(403).json({ error: 'Forbidden: Admin only' });
         }
 
@@ -39,7 +39,10 @@ router.post('/action', authMiddleware, async (req, res) => {
                 await supabaseAdmin.from('profiles').update({ active: true }).eq('id', userId);
                 return res.json({ success: true });
             }
+            case 'delete':
             case 'delete_user': {
+                // Delete profile first (cascade), then auth user
+                await supabaseAdmin.from('profiles').delete().eq('id', userId);
                 await supabaseAdmin.auth.admin.deleteUser(userId);
                 return res.json({ success: true });
             }
