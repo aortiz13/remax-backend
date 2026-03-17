@@ -631,7 +631,7 @@ new Worker('import', async (job) => {
 
                     const { data: insertedProps, error: insertErr } = await supabaseAdmin
                         .from('properties')
-                        .insert(dbProperties)
+                        .upsert(dbProperties, { onConflict: 'listing_link, agent_id' })
                         .select('id, listing_reference, agent_id');
 
                     if (insertErr) {
