@@ -2,7 +2,7 @@ import { Router } from 'express';
 import express from 'express';
 import crypto from 'crypto';
 import Busboy from 'busboy';
-import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectsCommand, CreateBucketCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
 import authMiddleware from '../middleware/auth.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
@@ -28,6 +28,25 @@ const s3 = new S3Client({
 // S3/MinIO requires hyphens in bucket names, but Supabase uses underscores
 function normalizeBucket(name) {
     return name.replace(/_/g, '-');
+}
+
+// Auto-create MinIO buckets if they don't exist (cache to avoid repeated checks)
+const knownBuckets = new Set();
+async function ensureBucket(bucketName) {
+    if (knownBuckets.has(bucketName)) return;
+    try {
+        await s3.send(new HeadBucketCommand({ Bucket: bucketName }));
+        knownBuckets.add(bucketName);
+    } catch (err) {
+        if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404 || err.name === 'NoSuchBucket') {
+            console.log(`[Storage] Bucket "${bucketName}" not found in MinIO, creating...`);
+            await s3.send(new CreateBucketCommand({ Bucket: bucketName }));
+            knownBuckets.add(bucketName);
+            console.log(`[Storage] Bucket "${bucketName}" created successfully.`);
+        } else {
+            throw err;
+        }
+    }
 }
 
 // Helper: create a simple signed token for file access
@@ -205,6 +224,7 @@ router.post('/object/:bucket/*', authMiddleware, async (req, res) => {
             return res.status(400).json({ error: 'Empty file body' });
         }
 
+        await ensureBucket(bucket);
         await s3.send(new PutObjectCommand({
             Bucket: bucket,
             Key: key,
@@ -234,6 +254,7 @@ router.put('/object/:bucket/*', authMiddleware, async (req, res) => {
             return res.status(400).json({ error: 'Empty file body' });
         }
 
+        await ensureBucket(bucket);
         await s3.send(new PutObjectCommand({
             Bucket: bucket,
             Key: key,
