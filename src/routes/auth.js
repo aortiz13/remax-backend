@@ -70,7 +70,6 @@ router.post('/google', authMiddleware, async (req, res) => {
                 .update({
                     google_refresh_token: null,
                     google_sync_token: null,
-                    google_calendar_connected: false,
                 })
                 .eq('id', agentId);
 
@@ -100,18 +99,37 @@ router.post('/google', authMiddleware, async (req, res) => {
         }
 
         // Save refresh token to profile
-        const updateData = {
-            google_calendar_connected: true,
-        };
+        const updateData = {};
         // Only update refresh_token if Google returned one (it won't on re-auth without prompt=consent)
         if (tokens.refresh_token) {
             updateData.google_refresh_token = tokens.refresh_token;
         }
 
-        await supabaseAdmin
-            .from('profiles')
-            .update(updateData)
-            .eq('id', agentId);
+        if (Object.keys(updateData).length > 0) {
+            const { error: updateError } = await supabaseAdmin
+                .from('profiles')
+                .update(updateData)
+                .eq('id', agentId);
+
+            if (updateError) {
+                console.error('Failed to save Google tokens:', updateError.message);
+                return res.status(500).json({ error: 'Failed to save Google tokens' });
+            }
+        }
+
+        if (!tokens.refresh_token) {
+            // Google didn't return a refresh token — user may need to re-authorize with consent
+            const { data: existingProfile } = await supabaseAdmin
+                .from('profiles')
+                .select('google_refresh_token')
+                .eq('id', agentId)
+                .single();
+
+            if (!existingProfile?.google_refresh_token) {
+                console.error('No refresh token received from Google and none stored');
+                return res.status(400).json({ error: 'Google did not provide a refresh token. Please try disconnecting and reconnecting.' });
+            }
+        }
 
         res.json({ success: true, access_token: tokens.access_token });
     } catch (error) {
