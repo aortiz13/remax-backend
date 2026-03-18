@@ -3,7 +3,7 @@ import { Router } from 'express';
 const router = Router();
 
 // In-memory cache
-let ufCache = null; // { valor, fecha, fetchedAt }
+let ufCache = null; // { valor, fecha, fetchedAt, source }
 const CACHE_TTL = 1000 * 60 * 60; // 1 hour
 
 /**
@@ -79,7 +79,25 @@ router.get('/', async (req, res) => {
 
 /**
  * Scrape today's UF from the SII website (always available, no API key needed).
- * URL pattern: https://www.sii.cl/valores_y_fechas/uf/uf{YYYY}.htm
+ * URL: https://www.sii.cl/valores_y_fechas/uf/uf{YYYY}.htm
+ *
+ * HTML structure per month:
+ *   <div class='meses' id='mes_marzo'>
+ *     <table>
+ *       <tr><th colspan='6'><h2>Marzo</h2></th></tr>
+ *       <tr>
+ *         <th>1</th><td>39.796,31</td>
+ *         <th>11</th><td>39.841,72</td>
+ *         <th>21</th><td>39.841,72</td>
+ *       </tr>
+ *       <tr>
+ *         <th>2</th><td>39.801,98</td>
+ *         <th>12</th><td>...</td>
+ *         <th>22</th><td>...</td>
+ *       </tr>
+ *       ...
+ *     </table>
+ *   </div>
  */
 async function scrapeUFFromSII() {
     const now = new Date();
@@ -87,9 +105,10 @@ async function scrapeUFFromSII() {
     const month = now.getMonth(); // 0-indexed
     const day = now.getDate();
 
-    const monthNames = [
-        'Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
-        'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'
+    const monthIds = [
+        'mes_enero', 'mes_febrero', 'mes_marzo', 'mes_abril',
+        'mes_mayo', 'mes_junio', 'mes_julio', 'mes_agosto',
+        'mes_septiembre', 'mes_octubre', 'mes_noviembre', 'mes_diciembre'
     ];
 
     const controller = new AbortController();
@@ -103,39 +122,38 @@ async function scrapeUFFromSII() {
 
     const html = await response.text();
 
-    // The SII table has rows for each month, with columns for days 1-31
-    // Each row starts with the month name, then has <td> values for each day
-    const targetMonth = monthNames[month];
+    // Extract the month section
+    const monthId = monthIds[month];
+    const sectionStart = html.indexOf(`id='${monthId}'`);
+    if (sectionStart < 0) return null;
 
-    // Find the table rows containing month data
-    // Pattern: find the row that contains the month name, then extract td values
-    const rowRegex = new RegExp(
-        `<tr[^>]*>\\s*<th[^>]*>[^<]*${targetMonth}[^<]*</th>([\\s\\S]*?)</tr>`,
-        'i'
-    );
-    const rowMatch = html.match(rowRegex);
+    // Find the end of this month section (next <div class='meses' or end of content)
+    const nextSection = html.indexOf("<div class='meses'", sectionStart + 1);
+    const sectionHtml = nextSection > 0
+        ? html.substring(sectionStart, nextSection)
+        : html.substring(sectionStart);
 
-    if (!rowMatch) return null;
-
-    // Extract all td values from this row
-    const tdRegex = /<td[^>]*>([\d.,]*)<\/td>/g;
-    const values = [];
-    let m;
-    while ((m = tdRegex.exec(rowMatch[1])) !== null) {
-        values.push(m[1]);
+    // Extract all day-value pairs: <th...><strong>DAY</strong></th><td...>VALUE</td>
+    const pairRegex = /<th[^>]*>\s*<strong>(\d+)<\/strong>\s*<\/th>\s*<td[^>]*>([\d.,]*)<\/td>/g;
+    const dayValues = {};
+    let match;
+    while ((match = pairRegex.exec(sectionHtml)) !== null) {
+        const dayNum = parseInt(match[1], 10);
+        const rawValue = match[2].trim();
+        if (rawValue) {
+            // Parse Chilean number format: "39.841,72" → 39841.72
+            const parsed = parseFloat(rawValue.replace(/\./g, '').replace(',', '.'));
+            if (!isNaN(parsed) && parsed > 0) {
+                dayValues[dayNum] = parsed;
+            }
+        }
     }
 
-    // Day index is (day - 1), since values[0] = day 1
-    // Try today first, then go backwards to find the most recent value
+    // Try today first, then go backwards to find most recent value
     for (let d = day; d >= 1; d--) {
-        const val = values[d - 1];
-        if (val && val.trim()) {
-            // Parse Chilean number format: "39.841,72" → 39841.72
-            const parsed = parseFloat(val.replace(/\./g, '').replace(',', '.'));
-            if (!isNaN(parsed) && parsed > 0) {
-                const fecha = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-                return { valor: parsed, fecha, source: 'sii' };
-            }
+        if (dayValues[d]) {
+            const fecha = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+            return { valor: dayValues[d], fecha, source: 'sii' };
         }
     }
 
