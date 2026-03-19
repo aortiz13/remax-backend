@@ -1,7 +1,8 @@
 import cron from 'node-cron';
-import { calendarQueue, importQueue, youtubeQueue, cameraReminderQueue, cleanupQueue } from '../queues/index.js';
+import { calendarQueue, importQueue, youtubeQueue, cameraReminderQueue, cleanupQueue, recruitmentQueue } from '../queues/index.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
+import pool from '../lib/db.js';
 
 export function startCronJobs() {
     // Calendar sync — every 15 minutes
@@ -211,6 +212,231 @@ export function startCronJobs() {
             }
         } catch (err) {
             logErrorToSlack('error', { category: 'cron', action: 'inspection_reminder.exception', message: err.message, module: 'scheduler' });
+        }
+    });
+
+    // =============================================
+    // 🎯 RECRUITMENT CRON JOBS
+    // =============================================
+
+    // 1. Meeting-day confirmation — daily at 8am Chile (11:00 UTC)
+    //    Sends confirmation email to candidates with meetings TODAY
+    cron.schedule('0 11 * * *', async () => {
+        console.log('⏰ Cron: Recruitment meeting-day confirmation');
+        try {
+            const today = new Date().toISOString().split('T')[0];
+
+            // Find candidates with meeting_date = today in "Reunión Agendada" or "Reunión Confirmada"
+            const { data: candidates, error } = await supabaseAdmin
+                .from('recruitment_candidates')
+                .select('*')
+                .in('pipeline_stage', ['Reunión Agendada', 'Reunión Confirmada'])
+                .gte('meeting_date', `${today}T00:00:00`)
+                .lte('meeting_date', `${today}T23:59:59`);
+
+            if (error || !candidates?.length) {
+                console.log('✅ No recruitment meetings today');
+                return;
+            }
+
+            console.log(`📧 Found ${candidates.length} meetings today, queuing confirmations...`);
+
+            for (const candidate of candidates) {
+                if (!candidate.email) continue;
+
+                await recruitmentQueue.add('meeting-day-confirmation', {
+                    candidateId: candidate.id,
+                    candidateEmail: candidate.email,
+                    candidateName: `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim(),
+                    meetingDate: candidate.meeting_date,
+                }, { jobId: `meeting-confirm-${candidate.id}-${today}` });
+            }
+        } catch (err) {
+            logErrorToSlack('error', { category: 'cron', action: 'recruitment.meeting_confirmation', message: err.message, module: 'scheduler' });
+        }
+    });
+
+    // 2. No-response follow-up — every 2 hours
+    //    Candidates who received an email 48h+ ago without response
+    cron.schedule('0 */2 * * *', async () => {
+        console.log('⏰ Cron: Recruitment no-response follow-up');
+        try {
+            const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
+            // Find candidates with last email sent >48h ago, still in early stages
+            const { data: recentEmails } = await supabaseAdmin
+                .from('recruitment_email_logs')
+                .select('candidate_id, sent_at, status')
+                .eq('status', 'sent')
+                .lt('sent_at', cutoff)
+                .order('sent_at', { ascending: false });
+
+            if (!recentEmails?.length) return;
+
+            // Group by candidate, get only latest email per candidate
+            const latestByCandidate = {};
+            for (const log of recentEmails) {
+                if (!latestByCandidate[log.candidate_id]) {
+                    latestByCandidate[log.candidate_id] = log;
+                }
+            }
+
+            const candidateIds = Object.keys(latestByCandidate);
+            if (!candidateIds.length) return;
+
+            // Check which ones haven't received a follow-up yet
+            const { data: candidates } = await supabaseAdmin
+                .from('recruitment_candidates')
+                .select('id, email, first_name, last_name, pipeline_stage')
+                .in('id', candidateIds)
+                .in('pipeline_stage', ['Nuevo', 'Reunión Agendada']);
+
+            if (!candidates?.length) return;
+
+            // Check for existing follow-up emails
+            const { data: followUps } = await supabaseAdmin
+                .from('recruitment_email_logs')
+                .select('candidate_id')
+                .in('candidate_id', candidates.map(c => c.id))
+                .eq('email_type', 'Seguimiento')
+                .gte('sent_at', cutoff);
+
+            const alreadyFollowedUp = new Set((followUps || []).map(f => f.candidate_id));
+
+            let count = 0;
+            for (const candidate of candidates) {
+                if (alreadyFollowedUp.has(candidate.id) || !candidate.email) continue;
+
+                await recruitmentQueue.add('no-response-followup', {
+                    candidateId: candidate.id,
+                    candidateEmail: candidate.email,
+                    candidateName: `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim(),
+                    stage: candidate.pipeline_stage,
+                });
+                count++;
+            }
+
+            if (count > 0) console.log(`📧 Queued ${count} no-response follow-ups`);
+        } catch (err) {
+            logErrorToSlack('error', { category: 'cron', action: 'recruitment.followup', message: err.message, module: 'scheduler' });
+        }
+    });
+
+    // 3. Stagnant candidates alert — weekly Monday at 9am Chile (12:00 UTC)
+    //    Candidates in "Nuevo" for >7 days with no email sent
+    cron.schedule('0 12 * * 1', async () => {
+        console.log('⏰ Cron: Recruitment stagnant candidates check');
+        try {
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+            const { data: stagnant } = await supabaseAdmin
+                .from('recruitment_candidates')
+                .select('id, first_name, last_name, email, created_at')
+                .eq('pipeline_stage', 'Nuevo')
+                .lt('created_at', sevenDaysAgo);
+
+            if (!stagnant?.length) {
+                console.log('✅ No stagnant recruitment candidates');
+                return;
+            }
+
+            // Check which have zero emails
+            const { data: sentLogs } = await supabaseAdmin
+                .from('recruitment_email_logs')
+                .select('candidate_id')
+                .in('candidate_id', stagnant.map(s => s.id));
+
+            const hasEmail = new Set((sentLogs || []).map(l => l.candidate_id));
+            const noContact = stagnant.filter(s => !hasEmail.has(s.id));
+
+            if (noContact.length > 0) {
+                await recruitmentQueue.add('stagnant-candidates-alert', {
+                    candidates: noContact.map(c => ({
+                        id: c.id,
+                        name: `${c.first_name || ''} ${c.last_name || ''}`.trim(),
+                        email: c.email,
+                        createdAt: c.created_at,
+                    })),
+                    count: noContact.length,
+                });
+                console.log(`⚠️ Found ${noContact.length} stagnant candidates without any contact`);
+            }
+        } catch (err) {
+            logErrorToSlack('error', { category: 'cron', action: 'recruitment.stagnant', message: err.message, module: 'scheduler' });
+        }
+    });
+
+    // ─── Recruitment: Web form emails (every 2 minutes) ───
+    cron.schedule('*/2 * * * *', async () => {
+        try {
+            // Look up the info@ Gmail account
+            const { rows: [infoAccount] } = await pool.query(
+                `SELECT id, email_address, access_token, refresh_token FROM gmail_accounts WHERE email_address = 'info@remax-exclusive.cl' LIMIT 1`
+            );
+            if (!infoAccount) return;
+
+            // Fetch recent unread emails
+            const { google } = await import('googleapis');
+            const oauth2Client = new google.auth.OAuth2(
+                process.env.GOOGLE_CLIENT_ID,
+                process.env.GOOGLE_CLIENT_SECRET
+            );
+            oauth2Client.setCredentials({
+                access_token: infoAccount.access_token,
+                refresh_token: infoAccount.refresh_token,
+            });
+
+            const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+            // Search for unread emails from info@remax-exclusive.cl (form notifications)
+            const listRes = await gmail.users.messages.list({
+                userId: 'me',
+                q: 'is:unread from:info@remax-exclusive.cl -subject:"Nuevos envíos de Calculadora comisiones"',
+                maxResults: 10,
+            });
+
+            const messages = listRes.data.messages || [];
+            if (messages.length === 0) return;
+
+            console.log(`📧 Found ${messages.length} unread web form emails`);
+
+            for (const msg of messages) {
+                try {
+                    const fullMsg = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' });
+                    
+                    // Extract HTML body
+                    let htmlBody = '';
+                    const payload = fullMsg.data.payload;
+                    if (payload.body?.data) {
+                        htmlBody = Buffer.from(payload.body.data, 'base64').toString('utf-8');
+                    } else if (payload.parts) {
+                        const htmlPart = payload.parts.find(p => p.mimeType === 'text/html');
+                        if (htmlPart?.body?.data) {
+                            htmlBody = Buffer.from(htmlPart.body.data, 'base64').toString('utf-8');
+                        }
+                    }
+
+                    if (htmlBody) {
+                        await recruitmentQueue.add('process-web-form-email', {
+                            html: htmlBody,
+                            messageId: msg.id,
+                        }, { jobId: `web-form-${msg.id}` });
+                    }
+
+                    // Mark as read
+                    await gmail.users.messages.modify({
+                        userId: 'me', id: msg.id,
+                        requestBody: { removeLabelIds: ['UNREAD'] },
+                    });
+                } catch (msgErr) {
+                    console.error(`Error processing message ${msg.id}:`, msgErr.message);
+                }
+            }
+        } catch (err) {
+            // Don't log error if account simply doesn't exist yet
+            if (!err.message?.includes('undefined')) {
+                logErrorToSlack('error', { category: 'cron', action: 'recruitment.web_form_monitor', message: err.message, module: 'scheduler' });
+            }
         }
     });
 

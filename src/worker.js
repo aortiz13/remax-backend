@@ -82,6 +82,60 @@ new Worker('email', async (job) => {
     return result;
 }, { connection: redisConnection, concurrency: 5 });
 
+// =============================================
+// 📧 RECRUITMENT EMAIL WORKER — sends via emprendedores@ account
+// =============================================
+new Worker('email', async (job) => {
+    if (job.name !== 'send-recruitment-email') return;
+
+    const { accountEmail, to, subject, bodyHtml, candidateId } = job.data;
+    console.log(`📧 [Recruitment] Sending email to ${to} via ${accountEmail}...`);
+
+    const { data: account } = await supabaseAdmin
+        .from('gmail_accounts')
+        .select('*')
+        .eq('email_address', accountEmail)
+        .single();
+
+    if (!account) throw new Error(`No recruitment Gmail account found: ${accountEmail}`);
+
+    let accessToken = account.access_token;
+    let message = buildRawEmail({ from: accountEmail, to, subject, htmlBody: bodyHtml });
+
+    let response = await sendGmail(accessToken, accountEmail, message);
+
+    if (response.status === 401) {
+        accessToken = await getAccessToken(account.refresh_token, 'gmail_accounts', 'email_address', accountEmail);
+        response = await sendGmail(accessToken, accountEmail, message);
+    }
+
+    if (!response.ok) {
+        const errText = await response.text();
+        // Update log as failed
+        await supabaseAdmin.from('recruitment_email_logs')
+            .update({ status: 'failed', metadata: { error: errText } })
+            .eq('candidate_id', candidateId)
+            .eq('subject', subject)
+            .eq('status', 'queued')
+            .order('sent_at', { ascending: false })
+            .limit(1);
+        throw new Error(`Gmail send failed: ${response.status} ${errText}`);
+    }
+
+    // Update log as sent
+    await supabaseAdmin.from('recruitment_email_logs')
+        .update({ status: 'sent' })
+        .eq('candidate_id', candidateId)
+        .eq('subject', subject)
+        .eq('status', 'queued')
+        .order('sent_at', { ascending: false })
+        .limit(1);
+
+    const result = await response.json();
+    console.log(`✅ [Recruitment] Email sent: ${result.id}`);
+    return result;
+}, { connection: redisConnection, concurrency: 3 });
+
 async function sendGmail(accessToken, email, raw, threadId) {
     const body = { raw };
     if (threadId) body.threadId = threadId;
@@ -771,6 +825,163 @@ new Worker('import', async (job) => {
         console.log(`📦 Import worker job received for agent ${agentId} (triggered by ${triggeredBy})`);
     }
 }, { connection: redisConnection, concurrency: 1 });
+
+// =============================================
+// 🎯 RECRUITMENT AUTOMATION WORKER
+// =============================================
+new Worker('recruitment-automation', async (job) => {
+    const { emailQueue: eQueue } = await import('./queues/index.js');
+
+    if (job.name === 'meeting-day-confirmation') {
+        const { candidateId, candidateEmail, candidateName, meetingDate } = job.data;
+        console.log(`🎯 Meeting-day confirmation for ${candidateName} (${candidateEmail})`);
+
+        // Find the recruitment account
+        const { data: account } = await supabaseAdmin
+            .from('gmail_accounts')
+            .select('email_address')
+            .eq('purpose', 'recruitment')
+            .single();
+
+        if (!account) { console.log('⚠️ No recruitment Gmail account connected, skipping'); return; }
+
+        // Find a Confirmación template or use default text
+        const { data: templates } = await supabaseAdmin
+            .from('recruitment_email_templates')
+            .select('*')
+            .ilike('category', '%confirmación%')
+            .limit(1);
+
+        const meetingFormatted = meetingDate ? new Date(meetingDate).toLocaleString('es-CL', { dateStyle: 'long', timeStyle: 'short', timeZone: 'America/Santiago' }) : 'hoy';
+
+        let subject = `Confirmación de reunión - ${meetingFormatted}`;
+        let bodyHtml = `<p>Hola ${candidateName},</p><p>Te escribimos para confirmar tu reunión programada para hoy, <strong>${meetingFormatted}</strong>.</p><p>¿Podrías confirmar tu asistencia respondiendo este correo?</p><p>Saludos,<br>Equipo RE/MAX Exclusive</p>`;
+
+        if (templates?.[0]) {
+            // Simple variable replacement
+            subject = (templates[0].subject || subject)
+                .replace(/\{\{nombre\}\}/g, candidateName)
+                .replace(/\{\{fecha_reunion\}\}/g, meetingFormatted);
+            bodyHtml = (templates[0].body_html || bodyHtml)
+                .replace(/\{\{nombre\}\}/g, candidateName)
+                .replace(/\{\{fecha_reunion\}\}/g, meetingFormatted);
+        }
+
+        // Queue the email
+        await eQueue.add('send-recruitment-email', {
+            accountEmail: account.email_address,
+            to: candidateEmail,
+            subject,
+            bodyHtml,
+            candidateId,
+        }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
+
+        // Log it
+        await supabaseAdmin.from('recruitment_email_logs').insert({
+            candidate_id: candidateId,
+            email_type: 'Confirmación',
+            subject,
+            body_html: bodyHtml,
+            to_email: candidateEmail,
+            status: 'queued',
+            sent_at: new Date().toISOString(),
+            metadata: { trigger: 'cron-meeting-day' },
+        });
+
+        console.log(`✅ Meeting-day confirmation queued for ${candidateName}`);
+
+    } else if (job.name === 'no-response-followup') {
+        const { candidateId, candidateEmail, candidateName, stage } = job.data;
+        console.log(`🎯 No-response follow-up for ${candidateName} (stage: ${stage})`);
+
+        const { data: account } = await supabaseAdmin
+            .from('gmail_accounts')
+            .select('email_address')
+            .eq('purpose', 'recruitment')
+            .single();
+
+        if (!account) return;
+
+        // Find a Seguimiento template
+        const { data: templates } = await supabaseAdmin
+            .from('recruitment_email_templates')
+            .select('*')
+            .ilike('category', '%seguimiento%')
+            .limit(1);
+
+        let subject = `Seguimiento: RE/MAX Exclusive - Oportunidad de emprendimiento`;
+        let bodyHtml = `<p>Hola ${candidateName},</p><p>Te escribimos nuevamente porque nos interesa mucho tu perfil. ¿Pudiste revisar la información que te enviamos anteriormente?</p><p>Nos encantaría poder agendar una reunión contigo para conversar más al respecto.</p><p>Saludos,<br>Equipo RE/MAX Exclusive</p>`;
+
+        if (templates?.[0]) {
+            subject = (templates[0].subject || subject).replace(/\{\{nombre\}\}/g, candidateName);
+            bodyHtml = (templates[0].body_html || bodyHtml).replace(/\{\{nombre\}\}/g, candidateName);
+        }
+
+        await eQueue.add('send-recruitment-email', {
+            accountEmail: account.email_address,
+            to: candidateEmail,
+            subject,
+            bodyHtml,
+            candidateId,
+        }, { attempts: 3, backoff: { type: 'exponential', delay: 5000 } });
+
+        await supabaseAdmin.from('recruitment_email_logs').insert({
+            candidate_id: candidateId,
+            email_type: 'Seguimiento',
+            subject,
+            body_html: bodyHtml,
+            to_email: candidateEmail,
+            status: 'queued',
+            sent_at: new Date().toISOString(),
+            metadata: { trigger: 'cron-followup' },
+        });
+
+        console.log(`✅ Follow-up queued for ${candidateName}`);
+
+    } else if (job.name === 'stagnant-candidates-alert') {
+        const { candidates, count } = job.data;
+        console.log(`🎯 Stagnant candidates alert: ${count} candidates`);
+
+        // Send Slack notification
+        const { logErrorToSlack } = await import('./middleware/slackErrorLogger.js');
+        const candidateList = candidates
+            .slice(0, 10)
+            .map(c => `• ${c.name} (${c.email || 'sin email'}) — desde ${new Date(c.createdAt).toLocaleDateString('es-CL')}`)
+            .join('\n');
+
+        logErrorToSlack('warning', {
+            category: 'recruitment',
+            action: 'stagnant_candidates',
+            message: `⚠️ ${count} candidatos en "Nuevo" hace más de 7 días sin contactar`,
+            module: 'recruitment-cron',
+            details: { candidateList, totalCount: count },
+        });
+    } else if (job.name === 'process-web-form-email') {
+        // ─── Process web form email → create candidate ───
+        const { html, messageId } = job.data;
+        console.log(`📧 Processing web form email: ${messageId}`);
+
+        try {
+            const res = await fetch(`http://localhost:${process.env.PORT || 3000}/api/recruitment/leads/from-email`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ html, messageId }),
+            });
+            const result = await res.json();
+
+            if (result.duplicate) {
+                console.log(`⏭️ Duplicate candidate from web form (${messageId})`);
+            } else if (result.candidateId) {
+                console.log(`✅ Created candidate ${result.candidateId} from web form`);
+            } else {
+                console.error(`❌ Failed to create candidate from web form:`, result);
+            }
+        } catch (err) {
+            console.error('Error processing web form email:', err.message);
+            throw err; // Let BullMQ retry
+        }
+    }
+}, { connection: redisConnection, concurrency: 3 });
 
 // Start cron jobs
 startCronJobs();

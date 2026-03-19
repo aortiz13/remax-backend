@@ -18,6 +18,9 @@ import notificationRoutes from './routes/notifications.js';
 import ttsRoutes from './routes/tts.js';
 import storageRoutes from './routes/storage.js';
 import ufRoutes from './routes/uf.js';
+import onboardingRoutes from './routes/onboarding.js';
+import leadsRoutes from './routes/leads.js';
+import webFormsRoutes from './routes/webForms.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -192,6 +195,9 @@ app.use('/api/webhooks', webhookRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/tts', ttsRoutes);
 app.use('/api/uf', ufRoutes);
+app.use('/api/onboarding', onboardingRoutes);
+app.use('/api/recruitment', leadsRoutes);
+app.use('/api/webhooks', webFormsRoutes);
 
 // Legacy Supabase Edge Function path fallback
 // Maps /functions/v1/<name> → /api/<route> for old frontend clients

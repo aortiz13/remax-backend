@@ -177,5 +177,144 @@ router.post('/send', authMiddleware, async (req, res) => {
         res.status(400).json({ error: error.message });
     }
 });
+// POST /api/gmail/send-recruitment — Send email via shared recruitment Gmail (emprendedores@)
+router.post('/send-recruitment', authMiddleware, async (req, res) => {
+    try {
+        const { candidateId, toEmail, subject, bodyHtml, templateId, abVariant } = req.body;
+
+        if (!toEmail || !subject || !bodyHtml) {
+            return res.status(400).json({ error: 'Missing required fields: toEmail, subject, bodyHtml' });
+        }
+
+        // Find the recruitment Gmail account
+        const result = await pool.query(
+            `SELECT id, email_address FROM gmail_accounts WHERE purpose = 'recruitment' LIMIT 1`
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(400).json({ error: 'Recruitment Gmail account (emprendedores@) not connected. Please connect it first.' });
+        }
+
+        const recruitmentAccount = result.rows[0];
+
+        // Queue email for sending
+        await emailQueue.add('send-recruitment-email', {
+            accountEmail: recruitmentAccount.email_address,
+            to: toEmail,
+            subject,
+            bodyHtml,
+            candidateId,
+            templateId,
+            abVariant,
+            sentBy: req.user.id,
+        }, {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 5000 },
+        });
+
+        // Insert initial log
+        await pool.query(`
+            INSERT INTO recruitment_email_logs (candidate_id, email_type, subject, body_html, to_email, status, sent_at, ab_variant, metadata)
+            VALUES ($1, $2, $3, $4, $5, 'queued', NOW(), $6, $7)
+        `, [
+            candidateId,
+            'Manual',
+            subject,
+            bodyHtml,
+            toEmail,
+            abVariant || null,
+            JSON.stringify({ template_id: templateId, sent_by: req.user.id }),
+        ]);
+
+        res.json({ success: true, message: 'Email queued for sending' });
+    } catch (error) {
+        logErrorToSlack('error', {
+            category: 'backend', action: 'gmail.send_recruitment', message: error.message,
+            module: 'gmail',
+        });
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// GET /api/gmail/recruitment-account-status — Check if recruitment account is connected
+router.get('/recruitment-account-status', authMiddleware, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT email_address, updated_at FROM gmail_accounts WHERE purpose = 'recruitment' LIMIT 1`
+        );
+        res.json({
+            connected: result.rows.length > 0,
+            email: result.rows[0]?.email_address || null,
+            lastUpdated: result.rows[0]?.updated_at || null,
+        });
+    } catch (error) {
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// POST /api/gmail/connect-recruitment — Connect emprendedores@ as recruitment account
+router.post('/connect-recruitment', authMiddleware, async (req, res) => {
+    try {
+        const { code } = req.body;
+        if (!code) {
+            return res.status(400).json({ error: 'Missing OAuth code' });
+        }
+
+        // Exchange code for tokens
+        const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                code,
+                client_id: GOOGLE_CLIENT_ID,
+                client_secret: GOOGLE_CLIENT_SECRET,
+                redirect_uri: GOOGLE_GMAIL_REDIRECT_URI,
+                grant_type: 'authorization_code',
+            }),
+        });
+
+        const tokens = await tokenResponse.json();
+        if (tokens.error) throw new Error(tokens.error_description || tokens.error);
+
+        // Get email
+        const profileRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/profile', {
+            headers: { Authorization: `Bearer ${tokens.access_token}` },
+        });
+        const gmailProfile = await profileRes.json();
+
+        // Save as recruitment account
+        await pool.query(`
+            INSERT INTO gmail_accounts (agent_id, email_address, access_token, refresh_token, purpose, updated_at)
+            VALUES ($1, $2, $3, $4, 'recruitment', NOW())
+            ON CONFLICT (email_address)
+            DO UPDATE SET
+                access_token = EXCLUDED.access_token,
+                refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_accounts.refresh_token),
+                purpose = 'recruitment',
+                updated_at = NOW()
+        `, [req.user.id, gmailProfile.emailAddress, tokens.access_token, tokens.refresh_token]);
+
+        // Setup watch for incoming replies
+        await fetch('https://www.googleapis.com/gmail/v1/users/me/watch', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${tokens.access_token}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                topicName: process.env.GOOGLE_PUBSUB_TOPIC,
+                labelIds: ['INBOX'],
+            }),
+        });
+
+        res.json({ success: true, email: gmailProfile.emailAddress });
+    } catch (error) {
+        logErrorToSlack('error', {
+            category: 'backend', action: 'gmail.connect_recruitment', message: error.message,
+            module: 'gmail',
+        });
+        res.status(400).json({ error: error.message });
+    }
+});
 
 export default router;
