@@ -255,38 +255,39 @@ async function processComprarForm(data) {
         ]);
 
         // 2. Create external_lead
-        const shortId = Math.random().toString(36).substring(2, 8).toUpperCase();
-        const leadUrl = `${process.env.FORMS_URL || 'https://forms.remax-exclusive.cl'}/lead/${shortId}`;
-
         const { rows: [extLead] } = await client.query(`
-            INSERT INTO external_leads (
-                id, short_id, form_type, status,
-                first_name, last_name, email, phone,
-                operation_type, property_type,
-                raw_payload
-            ) VALUES (
-                gen_random_uuid(), $1, 'comprar', 'pending',
-                $2, $3, $4, $5,
-                $6, $7,
-                $8
-            ) RETURNING id, short_id
+            INSERT INTO external_leads (id, raw_data, status, short_id)
+            VALUES (gen_random_uuid(), $1, 'pending', $2)
+            RETURNING id, short_id
         `, [
-            shortId,
-            data.first_name || '',
-            data.last_name || '',
-            data.email || null,
-            data.phone || null,
-            data.operation_type || null,
-            data.property_type || null,
-            JSON.stringify(data),
+            JSON.stringify([{
+                'Datos Contacto': {
+                    nombre_apellido: `${data.first_name} ${data.last_name}`,
+                    email: data.email,
+                    telefono: data.phone,
+                },
+                'Búsqueda': {
+                    tipo_operacion: data.operation_type,
+                    tipo_propiedad: data.property_type,
+                    presupuesto_maximo: data.max_budget,
+                    zona: data.zone,
+                    dormitorios: data.bedrooms,
+                    banos: data.bathrooms,
+                    amenities: data.amenities,
+                },
+                'Fuente': 'Web - Formulario Buscar Inmueble',
+            }]),
+            `WEB-${Date.now().toString(36).toUpperCase()}`,
         ]);
 
         // 3. Create shift_guard_lead
         await client.query(`
             INSERT INTO shift_guard_leads (
-                id, external_lead_id, contact_id, is_guard
+                id, external_lead_id, contact_id, assigned_at, is_guard,
+                agent_id
             ) VALUES (
-                gen_random_uuid(), $1, $2, false
+                gen_random_uuid(), $1, $2, NOW(), false,
+                (SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1)
             )
         `, [extLead.id, contact.id]);
 
