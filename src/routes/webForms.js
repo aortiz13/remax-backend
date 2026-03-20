@@ -25,7 +25,11 @@ router.post('/web-forms', async (req, res) => {
             return res.json({ success: true, ...result });
         }
 
-        // Future: buscar, hazte-agente
+        if (formType === 'comprar') {
+            const result = await processComprarForm(body);
+            return res.json({ success: true, ...result });
+        }
+
         return res.status(400).json({ error: `Unknown form_type: ${formType}` });
     } catch (error) {
         console.error('Web form webhook error:', error);
@@ -212,6 +216,138 @@ function mapNeed(operationType) {
     if (operationType.toLowerCase().includes('arriendo')) return 'Arrendar';
     if (operationType.toLowerCase().includes('ambos') || operationType.toLowerCase().includes('y')) return 'Vender y Arrendar';
     return 'Vender';
+}
+
+function mapNeedComprar(operationType) {
+    if (!operationType) return 'Comprar';
+    if (operationType.toLowerCase().includes('arriendo')) return 'Arrendar';
+    return 'Comprar';
+}
+
+// ============================================================
+// Process "Comprar/Buscar" form
+// Creates: contact → external_lead → shift_guard_lead + activity_log
+// ============================================================
+async function processComprarForm(data) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // 1. Create contact
+        const { rows: [contact] } = await client.query(`
+            INSERT INTO contacts (
+                id, agent_id, first_name, last_name, email, phone,
+                source, source_detail, need, status, barrio_comuna
+            ) VALUES (
+                gen_random_uuid(),
+                (SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1),
+                $1, $2, $3, $4,
+                'Web - Buscar Inmueble', 'Formulario web buscar-inmueble',
+                $5, 'Nuevo', $6
+            ) RETURNING id
+        `, [
+            data.first_name || '',
+            data.last_name || '',
+            data.email || null,
+            data.phone || null,
+            mapNeedComprar(data.operation_type),
+            data.zone || null,
+        ]);
+
+        // 2. Create external_lead
+        const shortId = Math.random().toString(36).substring(2, 8).toUpperCase();
+        const leadUrl = `${process.env.FORMS_URL || 'https://forms.remax-exclusive.cl'}/lead/${shortId}`;
+
+        const { rows: [extLead] } = await client.query(`
+            INSERT INTO external_leads (
+                id, short_id, form_type, status,
+                first_name, last_name, email, phone,
+                operation_type, property_type,
+                raw_payload
+            ) VALUES (
+                gen_random_uuid(), $1, 'comprar', 'pending',
+                $2, $3, $4, $5,
+                $6, $7,
+                $8
+            ) RETURNING id, short_id
+        `, [
+            shortId,
+            data.first_name || '',
+            data.last_name || '',
+            data.email || null,
+            data.phone || null,
+            data.operation_type || null,
+            data.property_type || null,
+            JSON.stringify(data),
+        ]);
+
+        // 3. Create shift_guard_lead
+        await client.query(`
+            INSERT INTO shift_guard_leads (
+                id, external_lead_id, contact_id, is_guard
+            ) VALUES (
+                gen_random_uuid(), $1, $2, false
+            )
+        `, [extLead.id, contact.id]);
+
+        // 4. Timeline: log lead creation
+        await client.query(`
+            INSERT INTO activity_logs (id, actor_id, action, entity_type, entity_id, description, details, contact_id)
+            VALUES (
+                gen_random_uuid(),
+                (SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1),
+                'Lead Recibido',
+                'ExternalLead',
+                $1,
+                $2,
+                $3,
+                $4
+            )
+        `, [
+            extLead.id,
+            `Nuevo lead desde Formulario Web — Busca ${data.operation_type || 'Comprar'} ${data.property_type || ''} en ${data.zone || 'Sin zona'}`,
+            JSON.stringify({
+                source: 'Formulario Web - Buscar Inmueble',
+                operation_type: data.operation_type,
+                property_type: data.property_type,
+                zone: data.zone,
+                max_budget: data.max_budget,
+                bedrooms: data.bedrooms,
+                bathrooms: data.bathrooms,
+                amenities: data.amenities,
+                short_id: extLead.short_id,
+            }),
+            contact.id,
+        ]);
+
+        await client.query('COMMIT');
+
+        // 5. Notify Slack
+        logErrorToSlack('info', {
+            category: 'web-forms',
+            action: 'comprar.submitted',
+            message: `🔍 Nuevo lead Buscar Inmueble: ${data.first_name} ${data.last_name} — ${data.operation_type} ${data.property_type} en ${data.zone || 'Sin zona'}`,
+            module: 'web-forms',
+            details: {
+                contactId: contact.id,
+                email: data.email,
+                phone: data.phone,
+                zone: data.zone,
+                max_budget: data.max_budget,
+            },
+        });
+
+        return {
+            contactId: contact.id,
+            externalLeadId: extLead.id,
+            shortId: extLead.short_id,
+        };
+    } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 // ============================================================
