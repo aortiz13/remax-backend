@@ -101,6 +101,15 @@ async function processVenderForm(data) {
             data.observations || null,
         ]);
 
+        // 2b. Link contact ↔ property in junction table (CRM relationship)
+        await client.query(`
+            INSERT INTO property_contacts (id, property_id, contact_id, role, agent_id)
+            VALUES (
+                gen_random_uuid(), $1, $2, 'propietario',
+                (SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1)
+            )
+        `, [property.id, contact.id]);
+
         // 3. Create external_lead (raw data backup)
         const { rows: [extLead] } = await client.query(`
             INSERT INTO external_leads (id, raw_data, status, short_id)
