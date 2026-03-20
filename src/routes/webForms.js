@@ -338,6 +338,36 @@ async function processComprarForm(data) {
             },
         });
 
+        // 6. Notify n8n → WhatsApp Staff Comercial
+        const FORMS_URL = process.env.FORMS_URL || 'https://forms.remax-exclusive.cl';
+        const amenityLabels = {
+            parking: 'Estacionamiento', garden: 'Jardín', pool: 'Piscina',
+            elevator: 'Ascensor', terrace: 'Terraza', gym: 'Gimnasio',
+            storage: 'Bodega', security: 'Conserje',
+        };
+        const amenitiesStr = (data.amenities || []).map(a => amenityLabels[a] || a).join(', ');
+        try {
+            await fetch('https://workflow.remax-exclusive.cl/webhook/nuevo_lead_buscar', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    nombre: `${data.first_name} ${data.last_name}`.trim(),
+                    telefono: data.phone || '',
+                    email: data.email || '',
+                    operacion: data.operation_type || 'Compra',
+                    tipo_propiedad: data.property_type || '',
+                    presupuesto: data.max_budget || '',
+                    zona: data.zone || '',
+                    dormitorios: data.bedrooms || '',
+                    banos: data.bathrooms || '',
+                    amenities: amenitiesStr,
+                    lead_link: `${FORMS_URL}/lead/${extLead.short_id}`,
+                }),
+            });
+        } catch (n8nErr) {
+            console.error('n8n buscar webhook call failed:', n8nErr.message);
+        }
+
         return {
             contactId: contact.id,
             externalLeadId: extLead.id,
