@@ -377,7 +377,7 @@ router.post('/web-forms/lead/:shortId/assign', async (req, res) => {
                     banos: property?.bathrooms || '',
                 },
                 'Tipo de transacción': property?.operation_type || 'Venta',
-                'Fuente': 'Web - Formulario Vender',
+                'Fuente': agentId === 'remax-chile' ? 'Lead Derivado' : 'Guardia',
             }],
             lead_link: `${FORMS_URL}/lead/${shortId}`,
         };
@@ -397,13 +397,19 @@ router.post('/web-forms/lead/:shortId/assign', async (req, res) => {
         // If real agent, also update shift_guard_lead
         if (realAgentId && sgl?.contact_id) {
             await pool.query(
-                `UPDATE shift_guard_leads SET agent_id = $1 WHERE external_lead_id = $2`,
+                `UPDATE shift_guard_leads SET agent_id = $1, is_guard = true WHERE external_lead_id = $2`,
                 [realAgentId, lead.id]
             );
-            // Update contact owner
+            // Update contact owner + source
             await pool.query(
-                `UPDATE contacts SET agent_id = $1 WHERE id = $2`,
+                `UPDATE contacts SET agent_id = $1, source = 'Guardia' WHERE id = $2`,
                 [realAgentId, sgl.contact_id]
+            );
+        } else if (agentId === 'remax-chile' && sgl?.contact_id) {
+            // Update contact source for regional
+            await pool.query(
+                `UPDATE contacts SET source = 'Lead Derivado' WHERE id = $1`,
+                [sgl.contact_id]
             );
         }
 
