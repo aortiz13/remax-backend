@@ -36,7 +36,7 @@ const MINIO_INTERNAL_URL = `http://${process.env.MINIO_ENDPOINT || 'remax-storag
 const CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, x-client-info, x-supabase-api-version, range, prefer, x-upsert, accept-profile, content-profile',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, x-client-info, x-supabase-api-version, range, prefer, x-upsert, accept-profile, content-profile, x-wf-secret',
     'Access-Control-Expose-Headers': 'content-range, x-supabase-api-version',
 };
 
