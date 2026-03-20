@@ -147,6 +147,35 @@ async function processVenderForm(data) {
             )
         `, [extLead.id, contact.id]);
 
+        // 5. Timeline: log lead creation event
+        await client.query(`
+            INSERT INTO activity_logs (id, actor_id, action, entity_type, entity_id, description, details, property_id, contact_id)
+            VALUES (
+                gen_random_uuid(),
+                (SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1),
+                'Lead Recibido',
+                'ExternalLead',
+                $1,
+                $2,
+                $3,
+                $4,
+                $5
+            )
+        `, [
+            extLead.id,
+            `Nuevo lead desde Formulario Web — ${data.operation_type || 'Venta'} ${data.property_type || ''} en ${data.commune || data.address || ''}`,
+            JSON.stringify({
+                source: 'Formulario Web',
+                operation_type: data.operation_type,
+                property_type: data.property_type,
+                address: data.address,
+                commune: data.commune,
+                short_id: extLead.short_id,
+            }),
+            property.id,
+            contact.id,
+        ]);
+
         await client.query('COMMIT');
 
         // 5. Notify Slack
@@ -385,6 +414,35 @@ router.post('/web-forms/lead/:shortId/assign', async (req, res) => {
             module: 'web-forms',
             details: { shortId, agentEmail, agentId },
         });
+
+        // Timeline: log assignment event
+        const assignedName = agentId === 'remax-chile' ? 'RE/MAX Chile (Regional)' : agentEmail;
+        if (sgl?.contact_id) {
+            await pool.query(`
+                INSERT INTO activity_logs (id, actor_id, action, entity_type, entity_id, description, details, contact_id)
+                VALUES (
+                    gen_random_uuid(),
+                    $1,
+                    'Lead Derivado',
+                    'ExternalLead',
+                    $2,
+                    $3,
+                    $4,
+                    $5
+                )
+            `, [
+                realAgentId || (await pool.query(`SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1`)).rows[0]?.id,
+                lead.id,
+                `Lead derivado a ${assignedName}`,
+                JSON.stringify({
+                    assigned_to: agentEmail,
+                    assigned_agent_id: agentId,
+                    short_id: shortId,
+                    source: 'Formulario Web',
+                }),
+                sgl.contact_id,
+            ]);
+        }
 
         res.json({ success: true, assigned: agentEmail });
     } catch (error) {
