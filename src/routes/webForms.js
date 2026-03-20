@@ -114,7 +114,7 @@ async function processVenderForm(data) {
         const { rows: [extLead] } = await client.query(`
             INSERT INTO external_leads (id, raw_data, status, short_id)
             VALUES (gen_random_uuid(), $1, 'pending', $2)
-            RETURNING id
+            RETURNING id, short_id
         `, [
             JSON.stringify([{
                 'Datos Contacto': {
@@ -168,6 +168,7 @@ async function processVenderForm(data) {
             contactId: contact.id,
             propertyId: property.id,
             externalLeadId: extLead.id,
+            shortId: extLead.short_id,
         };
     } catch (error) {
         await client.query('ROLLBACK');
@@ -183,5 +184,213 @@ function mapNeed(operationType) {
     if (operationType.toLowerCase().includes('ambos') || operationType.toLowerCase().includes('y')) return 'Vender y Arrendar';
     return 'Vender';
 }
+
+// ============================================================
+// GET /api/webhooks/web-forms/lead/:shortId — Public lead page
+// ============================================================
+router.get('/web-forms/lead/:shortId', async (req, res) => {
+    try {
+        const { shortId } = req.params;
+
+        // Get external_lead
+        const { rows: [lead] } = await pool.query(`
+            SELECT el.id, el.raw_data, el.status, el.short_id, el.created_at, el.assigned_agent_id,
+                   p_agent.first_name AS assigned_first, p_agent.last_name AS assigned_last,
+                   p_agent.email AS assigned_email
+            FROM external_leads el
+            LEFT JOIN profiles p_agent ON el.assigned_agent_id = p_agent.id
+            WHERE el.short_id = $1
+        `, [shortId]);
+
+        if (!lead) return res.status(404).json({ error: 'Lead not found' });
+
+        // Get linked contact + property via shift_guard_leads
+        const { rows: [sgl] } = await pool.query(`
+            SELECT sgl.contact_id, sgl.agent_id, sgl.is_guard
+            FROM shift_guard_leads sgl
+            WHERE sgl.external_lead_id = $1
+            LIMIT 1
+        `, [lead.id]);
+
+        let contact = null;
+        let property = null;
+
+        if (sgl?.contact_id) {
+            const { rows: [c] } = await pool.query(
+                `SELECT id, first_name, last_name, email, phone, address, barrio_comuna, need, source FROM contacts WHERE id = $1`,
+                [sgl.contact_id]
+            );
+            contact = c;
+
+            // Get property linked to this contact
+            const { rows: [p] } = await pool.query(`
+                SELECT p.id, p.property_type, p.address, p.commune, p.operation_type,
+                       p.bedrooms, p.bathrooms, p.parking_spaces, p.m2_total, p.m2_built,
+                       p.latitude, p.longitude, p.notes
+                FROM properties p
+                WHERE p.owner_id = $1
+                ORDER BY p.created_at DESC LIMIT 1
+            `, [sgl.contact_id]);
+            property = p;
+        }
+
+        res.json({
+            lead: {
+                id: lead.id,
+                shortId: lead.short_id,
+                status: lead.status,
+                createdAt: lead.created_at,
+                rawData: lead.raw_data,
+                assigned: lead.assigned_agent_id ? {
+                    agentId: lead.assigned_agent_id,
+                    name: `${lead.assigned_first} ${lead.assigned_last}`,
+                    email: lead.assigned_email,
+                } : null,
+            },
+            contact,
+            property,
+        });
+    } catch (error) {
+        console.error('Get lead error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// GET /api/webhooks/web-forms/agents — List agents for dropdown
+// ============================================================
+router.get('/web-forms/agents', async (_req, res) => {
+    try {
+        const { rows } = await pool.query(`
+            SELECT id, first_name, last_name, email
+            FROM profiles
+            WHERE role = 'agent'
+            ORDER BY first_name
+        `);
+
+        // Add RE/MAX Chile option
+        const agents = [
+            ...rows.map(r => ({
+                id: r.id,
+                name: `${r.first_name} ${r.last_name}`,
+                email: r.email,
+            })),
+            { id: 'remax-chile', name: 'RE/MAX Chile (Regional)', email: 'regional@remax.cl' },
+        ];
+
+        res.json({ agents });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// POST /api/webhooks/web-forms/lead/:shortId/assign — Derive lead
+// ============================================================
+const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || 'https://workflow.remax-exclusive.cl/webhook/recibir_datos';
+
+router.post('/web-forms/lead/:shortId/assign', async (req, res) => {
+    try {
+        const { shortId } = req.params;
+        const { agentEmail, agentId } = req.body;
+
+        if (!agentEmail) return res.status(400).json({ error: 'agentEmail is required' });
+
+        // Get lead
+        const { rows: [lead] } = await pool.query(
+            `SELECT id, raw_data, status, assigned_agent_id FROM external_leads WHERE short_id = $1`,
+            [shortId]
+        );
+        if (!lead) return res.status(404).json({ error: 'Lead not found' });
+        if (lead.assigned_agent_id) return res.status(409).json({ error: 'Lead already assigned' });
+
+        // Update external_lead status
+        const realAgentId = agentId === 'remax-chile' ? null : agentId;
+        await pool.query(
+            `UPDATE external_leads SET status = 'assigned', assigned_agent_id = $1 WHERE id = $2`,
+            [realAgentId, lead.id]
+        );
+
+        // Get contact + property for payload
+        const { rows: [sgl] } = await pool.query(
+            `SELECT contact_id FROM shift_guard_leads WHERE external_lead_id = $1 LIMIT 1`,
+            [lead.id]
+        );
+        let contact = null;
+        let property = null;
+        if (sgl?.contact_id) {
+            const { rows: [c] } = await pool.query(
+                `SELECT first_name, last_name, email, phone FROM contacts WHERE id = $1`,
+                [sgl.contact_id]
+            );
+            contact = c;
+            const { rows: [p] } = await pool.query(
+                `SELECT property_type, address, commune, operation_type, bedrooms, bathrooms FROM properties WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 1`,
+                [sgl.contact_id]
+            );
+            property = p;
+        }
+
+        // Build n8n payload
+        const FORMS_URL = process.env.FORMS_URL || 'https://forms.remax-exclusive.cl';
+        const n8nPayload = {
+            agent: { email: agentEmail },
+            lead_data: [{
+                'Datos Contacto': {
+                    nombre_apellido: contact ? `${contact.first_name} ${contact.last_name}` : '',
+                    telefono: contact?.phone || '',
+                    correo: contact?.email || '',
+                },
+                'Datos Propiedad': {
+                    tipo_inmueble: property?.property_type || '',
+                    direccion_propiedad: property?.address || '',
+                    habitaciones: property?.bedrooms || '',
+                    banos: property?.bathrooms || '',
+                },
+                'Tipo de transacción': property?.operation_type || 'Venta',
+                'Fuente': 'Web - Formulario Vender',
+            }],
+            lead_link: `${FORMS_URL}/lead/${shortId}`,
+        };
+
+        // Call n8n webhook
+        try {
+            await fetch(N8N_WEBHOOK_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(n8nPayload),
+            });
+        } catch (n8nErr) {
+            console.error('n8n webhook call failed:', n8nErr.message);
+            // Don't fail the whole request — assignment is already done
+        }
+
+        // If real agent, also update shift_guard_lead
+        if (realAgentId && sgl?.contact_id) {
+            await pool.query(
+                `UPDATE shift_guard_leads SET agent_id = $1 WHERE external_lead_id = $2`,
+                [realAgentId, lead.id]
+            );
+            // Update contact owner
+            await pool.query(
+                `UPDATE contacts SET agent_id = $1 WHERE id = $2`,
+                [realAgentId, sgl.contact_id]
+            );
+        }
+
+        logErrorToSlack('info', {
+            category: 'web-forms',
+            action: 'lead.assigned',
+            message: `📤 Lead ${shortId} derivado a ${agentEmail}`,
+            module: 'web-forms',
+            details: { shortId, agentEmail, agentId },
+        });
+
+        res.json({ success: true, assigned: agentEmail });
+    } catch (error) {
+        console.error('Assign lead error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
 
 export default router;
