@@ -624,4 +624,197 @@ router.post('/web-forms/lead/:shortId/assign', async (req, res) => {
     }
 });
 
+// ============================================================
+// POST /api/webhooks/whatsapp-leads — WhatsApp Bot Leads (n8n)
+// ============================================================
+router.post('/whatsapp-leads', async (req, res) => {
+    try {
+        const {
+            source = 'WhatsApp',
+            conversation_id,
+            phone,
+            contact: contactData,
+            property: propertyData,
+            url_propiedad,
+            resumen,
+        } = req.body;
+
+        const shortId = `WA-${Date.now().toString(36).toUpperCase()}`;
+        const FORMS_URL = process.env.FORMS_URL || 'https://solicitudes.remax-exclusive.cl';
+
+        // Build raw_data in the same format as web leads
+        const rawData = [{
+            'Datos Contacto': {
+                nombre_apellido: contactData?.nombre
+                    ? `${contactData.nombre} ${contactData.apellido || ''}`.trim()
+                    : null,
+                correo: contactData?.email || null,
+                telefono: contactData?.telefono || phone || null,
+            },
+            'Datos Propiedad': {
+                tipo_transaccion: propertyData?.tipo_transaccion || null,
+                tipo_inmueble: propertyData?.tipo_inmueble || null,
+                direccion_propiedad: propertyData?.direccion || null,
+                habitaciones: propertyData?.habitaciones || null,
+                banos: propertyData?.banos || null,
+                superficie_m2: propertyData?.superficie_total_m2 || propertyData?.superficie_m2 || null,
+                presupuesto: propertyData?.presupuesto_estimado || propertyData?.presupuesto || null,
+            },
+            'Fuente': source,
+            'URL Propiedad': url_propiedad || null,
+            'Resumen': resumen || null,
+        }];
+
+        // ── "Ver Agente" → lightweight registration only ──
+        if (source === 'WhatsApp - Ver Agente') {
+            const { rows: [extLead] } = await pool.query(`
+                INSERT INTO external_leads (id, raw_data, status, short_id, source, conversation_id)
+                VALUES (gen_random_uuid(), $1, 'info', $2, $3, $4)
+                RETURNING id, short_id
+            `, [JSON.stringify(rawData), shortId, source, conversation_id || null]);
+
+            logErrorToSlack('info', {
+                category: 'whatsapp-leads',
+                action: 'lead.ver_agente',
+                message: `📱 WhatsApp Lead (Ver Agente): ${contactData?.telefono || phone || 'Sin teléfono'}`,
+                module: 'whatsapp-leads',
+                details: { leadId: extLead.id, shortId, url_propiedad },
+            });
+
+            return res.json({
+                success: true,
+                leadId: extLead.id,
+                shortId: extLead.short_id,
+            });
+        }
+
+        // ── "Calificado" → full flow (contact + shift_guard_lead + derivation) ──
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            // 1. Create contact
+            const firstName = contactData?.nombre || '';
+            const lastName = contactData?.apellido || '';
+            const fullName = `${firstName} ${lastName}`.trim();
+
+            const { rows: [newContact] } = await client.query(`
+                INSERT INTO contacts (
+                    id, agent_id, first_name, last_name, email, phone,
+                    source, source_detail, need, status
+                ) VALUES (
+                    gen_random_uuid(),
+                    (SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1),
+                    $1, $2, $3, $4,
+                    'WhatsApp Bot', $5,
+                    $6, 'Nuevo'
+                ) RETURNING id
+            `, [
+                firstName || fullName,
+                lastName,
+                contactData?.email || null,
+                contactData?.telefono || phone || null,
+                `Calificado vía WhatsApp Bot - Conv #${conversation_id || 'N/A'}`,
+                mapNeedFromTransaction(propertyData?.tipo_transaccion),
+            ]);
+
+            // 2. Create external_lead
+            const { rows: [extLead] } = await client.query(`
+                INSERT INTO external_leads (id, raw_data, status, short_id, source, conversation_id)
+                VALUES (gen_random_uuid(), $1, 'pending', $2, $3, $4)
+                RETURNING id, short_id
+            `, [JSON.stringify(rawData), shortId, source, conversation_id || null]);
+
+            // 3. Create shift_guard_lead (for admin to assign)
+            await client.query(`
+                INSERT INTO shift_guard_leads (
+                    id, external_lead_id, contact_id, assigned_at, is_guard,
+                    agent_id
+                ) VALUES (
+                    gen_random_uuid(), $1, $2, NOW(), false,
+                    (SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1)
+                )
+            `, [extLead.id, newContact.id]);
+
+            // 4. Timeline: log lead creation
+            await client.query(`
+                INSERT INTO activity_logs (id, actor_id, action, entity_type, entity_id, description, details, contact_id)
+                VALUES (
+                    gen_random_uuid(),
+                    (SELECT id FROM profiles WHERE role = 'comercial' LIMIT 1),
+                    'Lead Recibido',
+                    'ExternalLead',
+                    $1,
+                    $2,
+                    $3,
+                    $4
+                )
+            `, [
+                extLead.id,
+                `Nuevo lead WhatsApp Bot — ${propertyData?.tipo_transaccion || ''} ${propertyData?.tipo_inmueble || ''} en ${propertyData?.direccion || ''}`.trim(),
+                JSON.stringify({
+                    source: 'WhatsApp Bot',
+                    tipo_transaccion: propertyData?.tipo_transaccion,
+                    tipo_inmueble: propertyData?.tipo_inmueble,
+                    short_id: extLead.short_id,
+                    conversation_id,
+                }),
+                newContact.id,
+            ]);
+
+            await client.query('COMMIT');
+
+            const leadLink = `${FORMS_URL}/nuevolead/${extLead.short_id}`;
+
+            logErrorToSlack('info', {
+                category: 'whatsapp-leads',
+                action: 'lead.calificado',
+                message: `📱✅ WhatsApp Lead Calificado: ${fullName || phone} — ${propertyData?.tipo_transaccion || ''} ${propertyData?.tipo_inmueble || ''}`,
+                module: 'whatsapp-leads',
+                details: {
+                    leadId: extLead.id,
+                    shortId: extLead.short_id,
+                    contactId: newContact.id,
+                    leadLink,
+                },
+            });
+
+            return res.json({
+                success: true,
+                leadId: extLead.id,
+                shortId: extLead.short_id,
+                contactId: newContact.id,
+                lead_link: leadLink,
+            });
+
+        } catch (txError) {
+            await client.query('ROLLBACK');
+            throw txError;
+        } finally {
+            client.release();
+        }
+
+    } catch (error) {
+        console.error('WhatsApp lead webhook error:', error);
+        logErrorToSlack('error', {
+            category: 'whatsapp-leads',
+            action: 'lead.webhook_error',
+            message: error.message,
+            module: 'whatsapp-leads',
+            details: { stack: error.stack?.substring(0, 500) },
+        });
+        res.status(500).json({ error: error.message });
+    }
+});
+
+function mapNeedFromTransaction(tipo) {
+    if (!tipo) return 'Otro';
+    const t = tipo.toUpperCase();
+    if (t === 'VENDEDOR') return 'Vender';
+    if (t === 'ARRENDADOR') return 'Arrendar';
+    if (t === 'COMPRADOR') return 'Comprar';
+    if (t === 'ARRENDATARIO') return 'Arrendar';
+    return 'Otro';
+}
+
 export default router;
