@@ -669,7 +669,7 @@ router.post('/whatsapp-leads', async (req, res) => {
         if (source === 'WhatsApp - Ver Agente') {
             const { rows: [extLead] } = await pool.query(`
                 INSERT INTO external_leads (id, raw_data, status, short_id, source, conversation_id)
-                VALUES (gen_random_uuid(), $1, 'info', $2, $3, $4)
+                VALUES (gen_random_uuid(), $1, 'pending', $2, $3, $4)
                 RETURNING id, short_id
             `, [JSON.stringify(rawData), shortId, source, conversation_id || null]);
 
