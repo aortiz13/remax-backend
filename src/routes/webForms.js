@@ -197,6 +197,32 @@ async function processVenderForm(data) {
             },
         });
 
+        // 6. Notify n8n → WhatsApp Staff Comercial
+        const FORMS_URL = process.env.FORMS_URL || 'https://forms.remax-exclusive.cl';
+        try {
+            await fetch('https://workflow.remax-exclusive.cl/webhook/nuevo_lead_vender', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    nombre: `${data.first_name} ${data.last_name}`.trim(),
+                    telefono: data.phone || '',
+                    email: data.email || '',
+                    operacion: data.operation_type || 'Venta',
+                    tipo_propiedad: data.property_type || '',
+                    direccion: data.address || '',
+                    comuna: data.commune || '',
+                    m2_total: data.m2_total || '',
+                    dormitorios: data.bedrooms || '',
+                    banos: data.bathrooms || '',
+                    estacionamientos: data.parking_spaces || '',
+                    observaciones: data.observations || '',
+                    lead_link: `${FORMS_URL}/lead/${extLead.short_id}`,
+                }),
+            });
+        } catch (n8nErr) {
+            console.error('n8n vender webhook call failed:', n8nErr.message);
+        }
+
         return {
             contactId: contact.id,
             propertyId: property.id,
