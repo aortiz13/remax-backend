@@ -17,14 +17,17 @@ router.post('/agent', authMiddleware, async (req, res) => {
             .eq('id', adminId)
             .single();
 
-        if (!profile || !['admin', 'superadministrador'].includes(profile.role)) {
-            return res.status(403).json({ error: 'Forbidden: Admin only' });
+        const INVITE_ALLOWED_ROLES = ['superadministrador', 'legal', 'comercial', 'tecnico'];
+        if (!profile || !INVITE_ALLOWED_ROLES.includes(profile.role)) {
+            return res.status(403).json({ error: 'Forbidden: Management role required' });
         }
 
         const { email, firstName, lastName, role } = req.body;
         if (!email) return res.status(400).json({ error: 'Email is required' });
 
-        const assignedRole = (role === 'admin') ? 'admin' : 'agent';
+        // Map the role from frontend — keep known roles as-is, default to 'agent'
+        const VALID_ROLES = ['agent', 'superadministrador', 'legal', 'comercial', 'administracion', 'postulantes', 'tecnico'];
+        const assignedRole = VALID_ROLES.includes(role) ? role : 'agent';
         const origin = req.headers.origin || 'https://solicitudes.remax-exclusive.cl';
         const redirectTo = `${origin}/update-password`;
 
