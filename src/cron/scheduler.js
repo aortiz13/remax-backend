@@ -366,6 +366,98 @@ export function startCronJobs() {
         }
     });
 
+    // ─── Gmail: Renew Pub/Sub watch (daily at 2am Chile = 5am UTC) ───
+    // Gmail watch expires every 7 days; renewing daily ensures no gaps
+    cron.schedule('0 5 * * *', async () => {
+        console.log('⏰ Cron: Gmail Pub/Sub watch renewal');
+        try {
+            const { rows: accounts } = await pool.query(
+                `SELECT id, agent_id, email_address, access_token, refresh_token FROM gmail_accounts WHERE purpose = 'agent' OR purpose IS NULL`
+            );
+            if (!accounts || accounts.length === 0) {
+                console.log('✅ No Gmail accounts to renew watch for');
+                return;
+            }
+
+            const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+            const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+            const GOOGLE_PUBSUB_TOPIC = process.env.GOOGLE_PUBSUB_TOPIC;
+
+            for (const account of accounts) {
+                try {
+                    let accessToken = account.access_token;
+
+                    // Try watch with current token
+                    let watchRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/watch', {
+                        method: 'POST',
+                        headers: {
+                            Authorization: `Bearer ${accessToken}`,
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            topicName: GOOGLE_PUBSUB_TOPIC,
+                            labelIds: ['INBOX'],
+                        }),
+                    });
+
+                    // Refresh token if expired
+                    if (watchRes.status === 401) {
+                        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: new URLSearchParams({
+                                client_id: GOOGLE_CLIENT_ID,
+                                client_secret: GOOGLE_CLIENT_SECRET,
+                                refresh_token: account.refresh_token,
+                                grant_type: 'refresh_token',
+                            }),
+                        });
+                        const tokenData = await tokenRes.json();
+                        if (tokenData.error) {
+                            console.error(`  ❌ Token refresh failed for ${account.email_address}: ${tokenData.error}`);
+                            continue;
+                        }
+                        accessToken = tokenData.access_token;
+
+                        // Update stored token
+                        await pool.query(
+                            `UPDATE gmail_accounts SET access_token = $1, updated_at = NOW() WHERE id = $2`,
+                            [accessToken, account.id]
+                        );
+
+                        // Retry watch with new token
+                        watchRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/watch', {
+                            method: 'POST',
+                            headers: {
+                                Authorization: `Bearer ${accessToken}`,
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                topicName: GOOGLE_PUBSUB_TOPIC,
+                                labelIds: ['INBOX'],
+                            }),
+                        });
+                    }
+
+                    const watchData = await watchRes.json();
+                    if (watchData.historyId) {
+                        await pool.query(
+                            `UPDATE gmail_accounts SET last_history_id = $1, updated_at = NOW() WHERE id = $2`,
+                            [watchData.historyId, account.id]
+                        );
+                        console.log(`  ✅ Watch renewed for ${account.email_address} (historyId: ${watchData.historyId})`);
+                    } else {
+                        console.warn(`  ⚠️ Watch renewal for ${account.email_address}:`, JSON.stringify(watchData));
+                    }
+                } catch (accountErr) {
+                    console.error(`  ❌ Watch renewal failed for ${account.email_address}:`, accountErr.message);
+                }
+            }
+        } catch (err) {
+            logErrorToSlack('error', { category: 'cron', action: 'gmail.watch_renewal', message: err.message, module: 'scheduler' });
+        }
+    });
+
     // ─── Recruitment: Web form emails (every 2 minutes) ───
     cron.schedule('*/2 * * * *', async () => {
         try {

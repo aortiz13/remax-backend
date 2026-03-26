@@ -2,6 +2,7 @@ import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import pool from '../lib/db.js';
 import { emailQueue } from '../queues/index.js';
+import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
@@ -311,6 +312,131 @@ router.post('/connect-recruitment', authMiddleware, async (req, res) => {
     } catch (error) {
         logErrorToSlack('error', {
             category: 'backend', action: 'gmail.connect_recruitment', message: error.message,
+            module: 'gmail',
+        });
+        res.status(400).json({ error: error.message });
+    }
+});
+
+// POST /api/gmail/sync — Manual sync: renew watch + backfill recent emails
+router.post('/sync', authMiddleware, async (req, res) => {
+    try {
+        const agentId = req.user.id;
+        const result = await pool.query(
+            `SELECT id, email_address, access_token, refresh_token, last_history_id FROM gmail_accounts WHERE agent_id = $1 LIMIT 1`,
+            [agentId]
+        );
+        if (result.rows.length === 0) return res.status(400).json({ error: 'No Gmail account connected' });
+        const account = result.rows[0];
+
+        // 1. Refresh access token
+        const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: GOOGLE_CLIENT_ID,
+                client_secret: GOOGLE_CLIENT_SECRET,
+                refresh_token: account.refresh_token,
+                grant_type: 'refresh_token',
+            }),
+        });
+        const tokenData = await tokenRes.json();
+        if (tokenData.error) throw new Error(`Token refresh failed: ${tokenData.error}`);
+        const accessToken = tokenData.access_token;
+
+        await pool.query(
+            `UPDATE gmail_accounts SET access_token = $1, updated_at = NOW() WHERE id = $2`,
+            [accessToken, account.id]
+        );
+
+        // 2. Renew Pub/Sub watch
+        const watchRes = await fetch('https://www.googleapis.com/gmail/v1/users/me/watch', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                topicName: process.env.GOOGLE_PUBSUB_TOPIC,
+                labelIds: ['INBOX'],
+            }),
+        });
+        const watchData = await watchRes.json();
+
+        if (watchData.historyId) {
+            await pool.query(
+                `UPDATE gmail_accounts SET last_history_id = $1, updated_at = NOW() WHERE id = $2`,
+                [watchData.historyId, account.id]
+            );
+        }
+
+        // 3. Backfill: fetch recent messages and upsert directly
+        const listRes = await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/${account.email_address}/messages?maxResults=50`,
+            { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+        const listData = await listRes.json();
+        const msgIds = (listData.messages || []).map(m => m.id);
+
+        let synced = 0;
+        for (const msgId of msgIds) {
+            try {
+                // Fetch full message
+                const msgRes = await fetch(
+                    `https://gmail.googleapis.com/gmail/v1/users/${account.email_address}/messages/${msgId}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Message-ID`,
+                    { headers: { Authorization: `Bearer ${accessToken}` } }
+                );
+                if (!msgRes.ok) continue;
+                const msgData = await msgRes.json();
+
+                const headers = msgData.payload?.headers || [];
+                const getH = (n) => headers.find(h => h.name.toLowerCase() === n.toLowerCase())?.value || '';
+                const extractEmail = (v) => { const m = (v||'').match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/); return m ? m[1].toLowerCase() : (v||'').toLowerCase().trim(); };
+
+                const fromAddr = extractEmail(getH('From'));
+                const toAddr = extractEmail(getH('To'));
+                const subject = getH('Subject') || '(Sin Asunto)';
+                const gmailThreadId = msgData.threadId;
+                const labels = msgData.labelIds || [];
+
+                // Upsert thread
+                const threadData = {
+                    gmail_thread_id: gmailThreadId,
+                    agent_id: account.agent_id,
+                    subject,
+                    labels,
+                    updated_at: new Date().toISOString(),
+                };
+                await supabaseAdmin.from('email_threads').upsert(threadData, { onConflict: 'gmail_thread_id' });
+                const { data: threadRec } = await supabaseAdmin.from('email_threads').select('id').eq('gmail_thread_id', gmailThreadId).single();
+                if (!threadRec) continue;
+
+                // Upsert message
+                await supabaseAdmin.from('email_messages').upsert({
+                    gmail_message_id: msgData.id,
+                    thread_id: threadRec.id,
+                    agent_id: account.agent_id,
+                    from_address: fromAddr,
+                    to_address: toAddr,
+                    subject,
+                    snippet: msgData.snippet || '',
+                    rfc_message_id: getH('Message-ID'),
+                    received_at: new Date(parseInt(msgData.internalDate)).toISOString(),
+                }, { onConflict: 'gmail_message_id' });
+                synced++;
+            } catch (e) {
+                console.warn(`Backfill msg ${msgId} error:`, e.message);
+            }
+        }
+
+        res.json({
+            success: true,
+            watchRenewed: !!watchData.historyId,
+            messagesQueued: synced,
+        });
+    } catch (error) {
+        logErrorToSlack('error', {
+            category: 'backend', action: 'gmail.sync', message: error.message,
             module: 'gmail',
         });
         res.status(400).json({ error: error.message });
