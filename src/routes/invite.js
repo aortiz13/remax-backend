@@ -37,6 +37,15 @@ router.post('/agent', authMiddleware, async (req, res) => {
         });
 
         if (error) throw error;
+
+        // Safety net: ensure auth.users.role is 'authenticated' (self-hosted GoTrue may leave it empty)
+        if (data?.user?.id) {
+            const { error: roleFixError } = await supabaseAdmin.rpc('fix_empty_auth_role', { target_user_id: data.user.id });
+            if (roleFixError) {
+                console.warn(`[invite] Could not verify auth role for ${email}:`, roleFixError.message);
+            }
+        }
+
         res.json(data);
     } catch (error) {
         logErrorToSlack('error', {
