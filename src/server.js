@@ -21,6 +21,7 @@ import ufRoutes from './routes/uf.js';
 import onboardingRoutes from './routes/onboarding.js';
 import leadsRoutes from './routes/leads.js';
 import webFormsRoutes from './routes/webForms.js';
+import guardLeadsRoutes from './routes/guardLeads.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -198,6 +199,7 @@ app.use('/api/uf', ufRoutes);
 app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/recruitment', leadsRoutes);
 app.use('/api/webhooks', webFormsRoutes);
+app.use('/api/guard-leads', guardLeadsRoutes);
 
 // Legacy Supabase Edge Function path fallback
 // Maps /functions/v1/<name> → /api/<route> for old frontend clients
