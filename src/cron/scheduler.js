@@ -1,5 +1,5 @@
 import cron from 'node-cron';
-import { calendarQueue, importQueue, youtubeQueue, cameraReminderQueue, cleanupQueue, recruitmentQueue } from '../queues/index.js';
+import { calendarQueue, importQueue, youtubeQueue, cameraReminderQueue, cleanupQueue, recruitmentQueue, taskReminderQueue } from '../queues/index.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import pool from '../lib/db.js';
@@ -529,6 +529,195 @@ export function startCronJobs() {
             if (!err.message?.includes('undefined')) {
                 logErrorToSlack('error', { category: 'cron', action: 'recruitment.web_form_monitor', message: err.message, module: 'scheduler' });
             }
+        }
+    });
+
+    // =============================================
+    // 🔔 TASK REMINDER NOTIFICATIONS
+    // =============================================
+
+    // 1. Punctual reminders — every 5 minutes
+    //    Checks for tasks with reminder_minutes where (execution_date - reminder_minutes) <= now
+    cron.schedule('*/5 * * * *', async () => {
+        try {
+            const { rows: tasks } = await pool.query(`
+                SELECT t.id, t.action, t.description, t.execution_date, t.reminder_minutes,
+                       t.is_all_day, t.agent_id, t.contact_id, t.property_id,
+                       p.first_name AS agent_first, p.last_name AS agent_last,
+                       p.email AS agent_email, p.phone AS agent_phone,
+                       p.notification_preferences,
+                       c.first_name AS contact_first, c.last_name AS contact_last,
+                       prop.address AS property_address
+                FROM crm_tasks t
+                JOIN profiles p ON p.id = t.agent_id
+                LEFT JOIN contacts c ON c.id = t.contact_id
+                LEFT JOIN properties prop ON prop.id = t.property_id
+                WHERE t.completed = false
+                  AND t.is_all_day = false
+                  AND t.reminder_minutes IS NOT NULL
+                  AND t.execution_date > NOW()
+                  AND (t.execution_date - (t.reminder_minutes || ' minutes')::interval) <= NOW()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notification_logs nl
+                      WHERE nl.reminder_key = 'reminder:' || t.id::text || ':' || t.reminder_minutes::text
+                  )
+            `);
+
+            if (tasks.length === 0) return;
+            console.log(`🔔 Found ${tasks.length} task reminder(s) to send`);
+
+            for (const task of tasks) {
+                const prefs = task.notification_preferences || { email: true, whatsapp: true };
+                const channels = [];
+                if (prefs.email && task.agent_email) channels.push('email');
+                if (prefs.whatsapp && task.agent_phone) channels.push('whatsapp');
+                if (channels.length === 0) continue;
+
+                await taskReminderQueue.add('send-reminder', {
+                    type: 'reminder',
+                    channels,
+                    agent: {
+                        id: task.agent_id,
+                        name: `${task.agent_first || ''} ${task.agent_last || ''}`.trim(),
+                        email: task.agent_email,
+                        phone: task.agent_phone,
+                    },
+                    tasks: [{
+                        id: task.id,
+                        title: task.action,
+                        description: task.description,
+                        execution_date: task.execution_date,
+                        execution_time: new Date(task.execution_date).toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/Santiago' }),
+                        reminder_minutes: task.reminder_minutes,
+                        contact_name: task.contact_first ? `${task.contact_first} ${task.contact_last || ''}`.trim() : null,
+                        property_address: task.property_address,
+                        is_all_day: false,
+                    }],
+                    reminder_key: `reminder:${task.id}:${task.reminder_minutes}`,
+                }, { jobId: `reminder-${task.id}-${task.reminder_minutes}` });
+            }
+        } catch (err) {
+            console.error('❌ Task reminder cron error:', err.message);
+            logErrorToSlack('error', { category: 'cron', action: 'task_reminder.check', message: err.message, module: 'scheduler' });
+        }
+    });
+
+    // 2. Daily 8am notifications (Chile time UTC-3 = 11:00 UTC)
+    //    - If agent has daily_summary ON → send full summary (today's tasks + overdue)
+    //    - If agent has daily_summary OFF → send individual all-day task notifications
+    cron.schedule('0 11 * * *', async () => {
+        console.log('⏰ Cron: Daily task notifications (8am Chile)');
+        try {
+            const todayKey = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+
+            // Get all agents with pending tasks for today or overdue
+            const { rows: agentTasks } = await pool.query(`
+                SELECT t.id, t.action, t.description, t.execution_date, t.reminder_minutes,
+                       t.is_all_day, t.agent_id, t.contact_id, t.property_id,
+                       p.first_name AS agent_first, p.last_name AS agent_last,
+                       p.email AS agent_email, p.phone AS agent_phone,
+                       p.notification_preferences,
+                       c.first_name AS contact_first, c.last_name AS contact_last,
+                       prop.address AS property_address,
+                       CASE
+                           WHEN (t.execution_date AT TIME ZONE 'America/Santiago')::date < CURRENT_DATE THEN true
+                           ELSE false
+                       END AS is_overdue
+                FROM crm_tasks t
+                JOIN profiles p ON p.id = t.agent_id
+                LEFT JOIN contacts c ON c.id = t.contact_id
+                LEFT JOIN properties prop ON prop.id = t.property_id
+                WHERE t.completed = false
+                  AND (
+                      -- Today's tasks
+                      (t.execution_date AT TIME ZONE 'America/Santiago')::date = CURRENT_DATE
+                      -- Or overdue tasks from past days
+                      OR (t.execution_date AT TIME ZONE 'America/Santiago')::date < CURRENT_DATE
+                  )
+                ORDER BY t.agent_id, t.is_all_day, t.execution_date
+            `);
+
+            if (agentTasks.length === 0) {
+                console.log('✅ No daily task notifications to send');
+                return;
+            }
+
+            // Group by agent
+            const byAgent = {};
+            for (const task of agentTasks) {
+                if (!byAgent[task.agent_id]) {
+                    byAgent[task.agent_id] = {
+                        agent: {
+                            id: task.agent_id,
+                            name: `${task.agent_first || ''} ${task.agent_last || ''}`.trim(),
+                            email: task.agent_email,
+                            phone: task.agent_phone,
+                        },
+                        prefs: task.notification_preferences || { email: true, whatsapp: true, daily_summary: false },
+                        tasks: [],
+                    };
+                }
+                byAgent[task.agent_id].tasks.push({
+                    id: task.id,
+                    title: task.action,
+                    description: task.description,
+                    execution_date: task.execution_date,
+                    execution_time: task.is_all_day ? null : new Date(task.execution_date).toLocaleTimeString('es-CL', { hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'America/Santiago' }),
+                    reminder_minutes: task.reminder_minutes,
+                    contact_name: task.contact_first ? `${task.contact_first} ${task.contact_last || ''}`.trim() : null,
+                    property_address: task.property_address,
+                    is_all_day: task.is_all_day,
+                    is_overdue: task.is_overdue,
+                });
+            }
+
+            let count = 0;
+            for (const [agentId, group] of Object.entries(byAgent)) {
+                const { agent, prefs, tasks } = group;
+                const channels = [];
+                if (prefs.email && agent.email) channels.push('email');
+                if (prefs.whatsapp && agent.phone) channels.push('whatsapp');
+                if (channels.length === 0) continue;
+
+                const dedupKey = `daily:${agentId}:${todayKey}`;
+
+                // Check dedup
+                const { rows: existing } = await pool.query(
+                    `SELECT 1 FROM notification_logs WHERE reminder_key = $1 LIMIT 1`,
+                    [dedupKey]
+                );
+                if (existing.length > 0) continue;
+
+                if (prefs.daily_summary) {
+                    // Send full daily summary
+                    await taskReminderQueue.add('send-reminder', {
+                        type: 'daily_summary',
+                        channels,
+                        agent,
+                        tasks,
+                        reminder_key: dedupKey,
+                    }, { jobId: `daily-summary-${agentId}-${todayKey}` });
+                } else {
+                    // Send only all-day task notifications individually
+                    const allDayTasks = tasks.filter(t => t.is_all_day);
+                    if (allDayTasks.length === 0) continue;
+
+                    await taskReminderQueue.add('send-reminder', {
+                        type: 'allday_8am',
+                        channels,
+                        agent,
+                        tasks: allDayTasks,
+                        reminder_key: dedupKey,
+                    }, { jobId: `allday-8am-${agentId}-${todayKey}` });
+                }
+                count++;
+            }
+
+            if (count > 0) console.log(`🔔 Queued daily notifications for ${count} agent(s)`);
+            else console.log('✅ No daily task notifications needed');
+        } catch (err) {
+            console.error('❌ Daily task notification error:', err.message);
+            logErrorToSlack('error', { category: 'cron', action: 'task_reminder.daily', message: err.message, module: 'scheduler' });
         }
     });
 

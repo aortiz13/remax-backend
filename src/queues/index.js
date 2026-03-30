@@ -16,5 +16,6 @@ export const calendarWebhookQueue = new Queue('calendar-webhook', defaultOpts);
 export const youtubeQueue = new Queue('youtube-sync', defaultOpts);
 export const cameraReminderQueue = new Queue('camera-reminder', defaultOpts);
 export const recruitmentQueue = new Queue('recruitment-automation', defaultOpts);
+export const taskReminderQueue = new Queue('task-reminder', defaultOpts);
 
 console.log('📋 All BullMQ queues initialized');

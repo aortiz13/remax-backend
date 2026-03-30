@@ -983,6 +983,80 @@ new Worker('recruitment-automation', async (job) => {
     }
 }, { connection: redisConnection, concurrency: 3 });
 
+// =============================================
+// 🔔 TASK REMINDER WORKER
+// =============================================
+new Worker('task-reminder', async (job) => {
+    const { type, channels, agent, tasks, reminder_key } = job.data;
+    console.log(`🔔 Processing ${type} for ${agent.name} via ${channels.join(', ')}`);
+
+    try {
+        // 1. Post to n8n Webhook
+        const N8N_WEBHOOK_URL = 'https://workflow.remax-exclusive.cl/webhook/task-reminders';
+        const response = await fetch(N8N_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                type,
+                channels,
+                agent,
+                tasks,
+                reminder_key,
+            }),
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`n8n webhook failed: ${response.status} ${errText}`);
+        }
+
+        console.log(`✅ n8n webhook triggered for ${reminder_key}`);
+
+        // 2. Log in database for deduplication
+        // In the case of daily summaries, we just log one record with task_id of the first task
+        const firstTaskId = tasks[0]?.id;
+        if (firstTaskId) {
+            for (const channel of channels) {
+                const { error: logErr } = await supabaseAdmin.from('notification_logs').insert({
+                    task_id: firstTaskId,
+                    agent_id: agent.id,
+                    channel: channel,
+                    notification_type: type,
+                    reminder_key: `${reminder_key}:${channel}`, // Unique key per channel for the log table
+                }).select('id').single();
+                
+                // If it fails due to unique constraint, that's fine (already logged)
+                if (logErr && logErr.code !== '23505') {
+                    console.error(`⚠️ Failed to log notification: ${logErr.message}`);
+                }
+            }
+            
+            // Also log the main deduplication key so the cron job sees it
+            const { error: dedupErr } = await supabaseAdmin.from('notification_logs').insert({
+                task_id: firstTaskId,
+                agent_id: agent.id,
+                channel: channels[0], // Arbitrary
+                notification_type: type,
+                reminder_key: reminder_key, // The exact key the cron job checks
+            }).select('id').single();
+            if (dedupErr && dedupErr.code !== '23505') {
+                console.error(`⚠️ Failed to log dedup key: ${dedupErr.message}`);
+            }
+        }
+        
+    } catch (error) {
+        console.error(`❌ Task reminder worker error: ${error.message}`);
+        const { logErrorToSlack } = await import('./middleware/slackErrorLogger.js');
+        logErrorToSlack('error', {
+            category: 'notifications',
+            action: 'task_reminder.worker',
+            message: `Failed to send ${type} to ${agent.name}: ${error.message}`,
+            module: 'worker',
+        });
+        throw error; // Let BullMQ retry
+    }
+}, { connection: redisConnection, concurrency: 3 });
+
 // Start cron jobs
 startCronJobs();
 
