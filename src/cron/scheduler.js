@@ -633,8 +633,11 @@ export function startCronJobs() {
                   AND (
                       -- Today's tasks
                       (t.execution_date AT TIME ZONE 'America/Santiago')::date = CURRENT_DATE
-                      -- Or overdue tasks from past days
-                      OR (t.execution_date AT TIME ZONE 'America/Santiago')::date < CURRENT_DATE
+                      -- Or overdue tasks from past days (only if they are NOT all-day events)
+                      OR (
+                          (t.execution_date AT TIME ZONE 'America/Santiago')::date < CURRENT_DATE
+                          AND t.is_all_day = false
+                      )
                   )
                 ORDER BY t.agent_id, t.is_all_day, t.execution_date
             `);
