@@ -726,6 +726,81 @@ export function startCronJobs() {
             console.error('❌ Daily task notification error:', err.message);
             logErrorToSlack('error', { category: 'cron', action: 'task_reminder.daily', message: err.message, module: 'scheduler' });
         }
+    // 3. Birthday Reminders — daily at 9am (Chile time UTC-3 = 12:00 UTC)
+    cron.schedule('0 12 * * *', async () => {
+        console.log('⏰ Cron: Birthday reminders check');
+        try {
+            const today = new Date();
+            const month = today.getMonth() + 1;
+            const day = today.getDate();
+
+            // Find agents with birthday reminders enabled
+            const { rows: agents } = await pool.query(`
+                SELECT id, first_name, last_name, email, phone, notification_preferences
+                FROM profiles
+                WHERE (notification_preferences->>'birthday_reminders')::boolean = true
+            `);
+
+            if (agents.length === 0) {
+                console.log('✅ No agents have birthday reminders enabled');
+                return;
+            }
+
+            for (const agent of agents) {
+                // Find contacts of this agent having a birthday today
+                const { rows: birthdayContacts } = await pool.query(`
+                    SELECT id, first_name, last_name, phone
+                    FROM contacts
+                    WHERE agent_id = $1
+                      AND EXTRACT(MONTH FROM dob) = $2
+                      AND EXTRACT(DAY FROM dob) = $3
+                `, [agent.id, month, day]);
+
+                if (birthdayContacts.length === 0) continue;
+
+                console.log(`🎂 Found ${birthdayContacts.length} birthdays for agent ${agent.first_name} ${agent.last_name}`);
+
+                const prefs = agent.notification_preferences || { email: true, whatsapp: true };
+                const channels = [];
+                if (prefs.email && agent.email) channels.push('email');
+                if (prefs.whatsapp && agent.phone) channels.push('whatsapp');
+                if (channels.length === 0) continue;
+
+                const todayKey = today.toISOString().split('T')[0];
+                const reminderKey = `birthday:${agent.id}:${todayKey}`;
+
+                // Check for existing notification to avoid duplicates
+                const { rows: existing } = await pool.query(
+                    `SELECT 1 FROM notification_logs WHERE reminder_key = $1 LIMIT 1`,
+                    [reminderKey]
+                );
+                if (existing.length > 0) continue;
+
+                await taskReminderQueue.add('send-reminder', {
+                    type: 'birthday_reminder',
+                    channels,
+                    agent: {
+                        id: agent.id,
+                        name: `${agent.first_name || ''} ${agent.last_name || ''}`.trim(),
+                        email: agent.email,
+                        phone: agent.phone,
+                    },
+                    tasks: birthdayContacts.map(c => ({
+                        id: c.id,
+                        title: `Cumpleaños de ${c.first_name} ${c.last_name || ''}`.trim(),
+                        description: `Hoy es el cumpleaños de tu contacto ${c.first_name} ${c.last_name || ''}. ¡No olvides saludarlo!`,
+                        execution_date: new Date().toISOString(),
+                        is_all_day: true,
+                        contact_id: c.id,
+                        contact_name: `${c.first_name} ${c.last_name || ''}`.trim(),
+                    })),
+                    reminder_key: reminderKey,
+                }, { jobId: `birthday-${agent.id}-${todayKey}` });
+            }
+        } catch (err) {
+            console.error('❌ Birthday reminder cron error:', err.message);
+            logErrorToSlack('error', { category: 'cron', action: 'birthday_reminder.check', message: err.message, module: 'scheduler' });
+        }
     });
 
     console.log('⏰ All cron jobs scheduled');
