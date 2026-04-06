@@ -726,6 +726,8 @@ export function startCronJobs() {
             console.error('❌ Daily task notification error:', err.message);
             logErrorToSlack('error', { category: 'cron', action: 'task_reminder.daily', message: err.message, module: 'scheduler' });
         }
+    });
+
     // 3. Birthday Reminders — daily at 9am (Chile time UTC-3 = 12:00 UTC)
     cron.schedule('0 12 * * *', async () => {
         console.log('⏰ Cron: Birthday reminders check');
