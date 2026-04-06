@@ -751,7 +751,7 @@ export function startCronJobs() {
             for (const agent of agents) {
                 // Find contacts of this agent having a birthday today
                 const { rows: birthdayContacts } = await pool.query(`
-                    SELECT id, first_name, last_name, phone
+                    SELECT id, first_name, last_name, phone, email
                     FROM contacts
                     WHERE agent_id = $1
                       AND EXTRACT(MONTH FROM dob) = $2
@@ -795,6 +795,8 @@ export function startCronJobs() {
                         is_all_day: true,
                         contact_id: c.id,
                         contact_name: `${c.first_name} ${c.last_name || ''}`.trim(),
+                        contact_phone: c.phone,
+                        contact_email: c.email,
                     })),
                     reminder_key: reminderKey,
                 }, { jobId: `birthday-${agent.id}-${todayKey}` });
