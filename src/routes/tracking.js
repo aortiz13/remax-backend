@@ -32,9 +32,8 @@ router.get('/open/:tracking_id', async (req, res) => {
             return;
         }
 
-        // Detect Apple Mail Privacy Protection (often uses Mozilla/5.0 with no OS info, or CFNetwork) 
-        // Detect Gmail Image Proxy (GoogleImageProxy)
-        const isBotProxy = userAgent.includes('GoogleImageProxy') || userAgent.includes('Yahoo') || /bot|crawl|spider/i.test(userAgent);
+        // Detect automatic crawler bots (Note: we intentionally EXCLUDE GoogleImageProxy because Gmail uses it for REAL user opens)
+        const isBotProxy = /bot|crawl|spider|slurp|facebookexternalhit/i.test(userAgent);
 
         // Fetch the email record
         const emailRecordRes = await pool.query(`SELECT id, contact_id, opens_count, created_at, subject FROM email_tracking_logs WHERE id = $1`, [tracking_id]);
@@ -49,17 +48,22 @@ router.get('/open/:tracking_id', async (req, res) => {
         const timeDiffSeconds = (new Date() - createdDate) / 1000;
         
         // If it's opened in less than 5 seconds from creation, it's likely an automated proxy pre-load
-        const isLikelyPreload = timeDiffSeconds < 5;
+        const isLikelyPreload = timeDiffSeconds < 10;
 
-        // Still update the open count for analytics, but maybe don't blast the timeline if it's fake
+        // Ensure we DO NOT INCREMENT open_count if it's a known bot/proxy or immediate preload.
+        if (isBotProxy || isLikelyPreload) {
+            return; // Ignore fake opens entirely
+        }
+
+        // It's a verified human open. Increment open count for the email.
         await pool.query(`
             UPDATE email_tracking_logs 
             SET opens_count = opens_count + 1, last_opened_at = NOW() 
             WHERE id = $1
         `, [tracking_id]);
 
-        // Only log to timeline IF it's the first open AND it passes proxy/bot checks
-        if (emailRow.opens_count === 0 && !isBotProxy && !isLikelyPreload) {
+        // Only log to timeline IF it's the first open
+        if (emailRow.opens_count === 0) {
             await pool.query(`
                 INSERT INTO activity_logs (actor_id, action, entity_type, entity_id, description, details, contact_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
