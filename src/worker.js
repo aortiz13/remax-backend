@@ -2,6 +2,7 @@ import { Worker } from 'bullmq';
 import { redisConnection } from './lib/redis.js';
 import supabaseAdmin from './lib/supabaseAdmin.js';
 import { startCronJobs } from './cron/scheduler.js';
+import crypto from 'crypto';
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -62,6 +63,45 @@ new Worker('email', async (job) => {
     }
 
     let accessToken = account.access_token;
+
+    // --- Tracking Pixel and URL Substitution ---
+    const trackingId = crypto.randomUUID();
+    let contactId = null;
+    
+    // Find contact by email to bind the tracking
+    if (to) {
+        const toEmailMatch = to.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/);
+        const toEmail = toEmailMatch ? toEmailMatch[1] : to;
+        const { data: contacts } = await supabaseAdmin.from('contacts').select('id').ilike('email', toEmail.trim()).limit(1);
+        if (contacts && contacts.length > 0) contactId = contacts[0].id;
+    }
+
+    // Log the intent to track
+    await supabaseAdmin.from('email_tracking_logs').insert({
+        id: trackingId,
+        contact_id: contactId,
+        subject: subject || '(Sin Asunto)',
+        log_type: 'crm_agent'
+    });
+
+    const API_URL = process.env.API_GATEWAY_URL || 'https://remax-crm-remax-app.jzuuqr.easypanel.host';
+    
+    // Re-write URLs for click tracking (ignore if it's already a tracking URL, or empty/hash)
+    if (htmlBody) {
+        htmlBody = htmlBody.replace(/href=["'](https?:\/\/[^"']+)["']/gi, (match, url) => {
+            if (url.includes('/api/tracking/')) return match;
+            return `href="${API_URL}/api/tracking/click/${trackingId}?url=${encodeURIComponent(url)}"`;
+        });
+        
+        // Inject Open Pixel
+        const pixelHtml = `<img src="${API_URL}/api/tracking/open/${trackingId}" width="1" height="1" style="display:none;" />`;
+        if (htmlBody.includes('</body>')) {
+            htmlBody = htmlBody.replace('</body>', `${pixelHtml}</body>`);
+        } else {
+            htmlBody += pixelHtml;
+        }
+    }
+
     // Try to send, refresh token if needed
     let message = buildRawEmail({ from: account.email_address, to, cc, bcc, subject, htmlBody, inReplyTo, attachments });
 
@@ -100,6 +140,36 @@ new Worker('email', async (job) => {
     if (!account) throw new Error(`No recruitment Gmail account found: ${accountEmail}`);
 
     let accessToken = account.access_token;
+
+    // --- Tracking Pixel and URL Substitution ---
+    const trackingId = crypto.randomUUID();
+
+    // Log the intent to track
+    await supabaseAdmin.from('email_tracking_logs').insert({
+        id: trackingId,
+        contact_id: candidateId, // for recruitment, candidateId is the contact
+        subject: subject || '(Sin Asunto)',
+        log_type: 'recruitment'
+    });
+
+    const API_URL = process.env.API_GATEWAY_URL || 'https://remax-crm-remax-app.jzuuqr.easypanel.host';
+    
+    // Re-write URLs for click tracking
+    if (bodyHtml) {
+        bodyHtml = bodyHtml.replace(/href=["'](https?:\/\/[^"']+)["']/gi, (match, url) => {
+            if (url.includes('/api/tracking/')) return match;
+            return `href="${API_URL}/api/tracking/click/${trackingId}?url=${encodeURIComponent(url)}"`;
+        });
+        
+        // Inject Open Pixel
+        const pixelHtml = `<img src="${API_URL}/api/tracking/open/${trackingId}" width="1" height="1" style="display:none;" />`;
+        if (bodyHtml.includes('</body>')) {
+            bodyHtml = bodyHtml.replace('</body>', `${pixelHtml}</body>`);
+        } else {
+            bodyHtml += pixelHtml;
+        }
+    }
+
     let message = buildRawEmail({ from: accountEmail, to, subject, htmlBody: bodyHtml });
 
     let response = await sendGmail(accessToken, accountEmail, message);
