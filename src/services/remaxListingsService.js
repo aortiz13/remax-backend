@@ -160,13 +160,23 @@ export function parseListing(item, agentId) {
     const descUpper = desc.toUpperCase();
     const typeNameUpper = propTypeName.toUpperCase();
 
-    // 1. UID mapping
+    // 1. Property Type UID mapping
     if (pTypeUID === 194) propertyType = 'Departamento';
     else if (pTypeUID === 202) propertyType = 'Casa';
     else if (pTypeUID === 13) propertyType = 'Comercial';
     else if (pTypeUID === 19) propertyType = 'Terreno';
 
-    // 2. Parse from URL
+    // 2. Transaction Type UID mapping (PRIMARY)
+    // 260 = Arriendo, 261 = Venta
+    if (transactionTypeUid === 260) {
+        operationType = 'arriendo';
+        statusArr = ['Publicada'];
+    } else if (transactionTypeUid === 261) {
+        operationType = 'venta';
+        statusArr = ['Publicada', 'En Venta'];
+    }
+
+    // 3. Parse from URL (FALLBACK/REFINEMENT)
     if (sourceUrl) {
         const urlLower = sourceUrl.toLowerCase();
         const urlParts = urlLower.split('/');
@@ -183,6 +193,7 @@ export function parseListing(item, agentId) {
             };
             if (typeMap[urlType]) propertyType = typeMap[urlType];
 
+            // Only override UID if we found a clear keyword in the URL
             if (urlOp === 'venta') {
                 operationType = 'venta';
                 statusArr = ['Publicada', 'En Venta'];
