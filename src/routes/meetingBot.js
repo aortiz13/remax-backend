@@ -237,4 +237,19 @@ router.get('/detect-platform', (req, res) => {
     });
 });
 
+// ─── GET /api/meeting-bot/auth/status — Check bot Google auth status ──
+router.get('/auth/status', async (req, res) => {
+    try {
+        const botUrl = process.env.MEETING_BOT_URL || 'http://remax-meeting-bot:3099';
+        const response = await fetch(`${botUrl}/auth/status`);
+        const data = await response.json();
+        res.json(data);
+    } catch (err) {
+        res.json({
+            authenticated: false,
+            message: 'Cannot reach bot service: ' + err.message,
+        });
+    }
+});
+
 export default router;
