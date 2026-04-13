@@ -16,7 +16,7 @@ router.use(authMiddleware);
 router.get('/me', async (req, res) => {
     try {
         const { rows } = await pool.query(
-            `SELECT id, full_name, email, role, avatar_url 
+            `SELECT id, CONCAT(first_name, ' ', COALESCE(last_name, '')) AS full_name, email, role, avatar_url 
              FROM profiles WHERE id = $1`,
             [req.user.id || req.user.sub]
         );
@@ -240,7 +240,7 @@ router.post('/:id/apply-form', async (req, res) => {
 router.get('/candidate/:candidateId', async (req, res) => {
     try {
         const { rows } = await pool.query(
-            `SELECT m.*, p.full_name AS recorder_name
+            `SELECT m.*, CONCAT(p.first_name, ' ', COALESCE(p.last_name, '')) AS recorder_name
              FROM recruitment_meetings m
              LEFT JOIN profiles p ON p.id = m.recorded_by
              WHERE m.candidate_id = $1
@@ -258,7 +258,7 @@ router.get('/candidate/:candidateId', async (req, res) => {
 router.get('/:id', async (req, res) => {
     try {
         const { rows } = await pool.query(
-            `SELECT m.*, p.full_name AS recorder_name
+            `SELECT m.*, CONCAT(p.first_name, ' ', COALESCE(p.last_name, '')) AS recorder_name
              FROM recruitment_meetings m
              LEFT JOIN profiles p ON p.id = m.recorded_by
              WHERE m.id = $1`,
