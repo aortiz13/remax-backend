@@ -24,6 +24,7 @@ import webFormsRoutes from './routes/webForms.js';
 import guardLeadsRoutes from './routes/guardLeads.js';
 import trackingRoutes from './routes/tracking.js';
 import meetingsRoutes from './routes/meetings.js';
+import meetingBotRoutes from './routes/meetingBot.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -204,6 +205,7 @@ app.use('/api/webhooks', webFormsRoutes);
 app.use('/api/guard-leads', guardLeadsRoutes);
 app.use('/api/tracking', trackingRoutes);
 app.use('/api/meetings', meetingsRoutes);
+app.use('/api/meeting-bot', meetingBotRoutes);
 
 // Legacy Supabase Edge Function path fallback
 // Maps /functions/v1/<name> → /api/<route> for old frontend clients
