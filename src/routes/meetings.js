@@ -51,6 +51,28 @@ router.get('/candidates/search', async (req, res) => {
     }
 });
 
+// ─── POST /api/meetings/candidates — Create new candidate from recorder ───
+router.post('/candidates', async (req, res) => {
+    try {
+        const { first_name, last_name, email, phone, source } = req.body;
+        if (!first_name) return res.status(400).json({ error: 'first_name is required' });
+
+        const id = crypto.randomUUID();
+        const { rows } = await pool.query(
+            `INSERT INTO recruitment_candidates (id, first_name, last_name, email, phone, source, pipeline_stage, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 'Nuevo Lead', NOW(), NOW())
+             RETURNING *`,
+            [id, first_name, last_name || null, email || null, phone || null, source || 'meeting_recorder']
+        );
+
+        console.log(`[Meetings] ✅ Candidate created: ${first_name} ${last_name || ''} (${id})`);
+        res.json(rows[0]);
+    } catch (err) {
+        console.error('[Meetings] Create candidate error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ─── POST /api/meetings/upload — Upload recording & transcribe ────────────
 router.post('/upload', (req, res) => {
     const busboy = Busboy({
@@ -75,7 +97,7 @@ router.post('/upload', (req, res) => {
     });
 
     busboy.on('field', (name, val) => {
-        if (name === 'candidate_id') candidateId = val;
+        if (name === 'candidate_id' || name === 'candidateId') candidateId = val;
         if (name === 'platform') platform = val;
     });
 
