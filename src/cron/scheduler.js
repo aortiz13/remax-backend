@@ -109,6 +109,31 @@ export function startCronJobs() {
         }
     });
 
+    // Management reports: auto-skip overdue >15 days — daily at 8:05am Chile (11:05 UTC)
+    cron.schedule('5 11 * * *', async () => {
+        console.log('⏰ Cron: Auto-skip management reports overdue >15 days');
+        try {
+            const { data, error } = await supabaseAdmin
+                .from('management_reports')
+                .update({ status: 'skipped', updated_at: new Date().toISOString() })
+                .in('status', ['pending', 'overdue'])
+                .lt('due_date', new Date(Date.now() - 15 * 86400000).toISOString().split('T')[0])
+                .select('id, report_number');
+
+            if (error) {
+                logErrorToSlack('error', { category: 'cron', action: 'report_autoskip.update', message: error.message, module: 'scheduler' });
+                return;
+            }
+            if (data && data.length > 0) {
+                console.log(`✅ Auto-skipped ${data.length} management report(s) overdue >15 days`);
+            } else {
+                console.log('✅ No management reports to auto-skip');
+            }
+        } catch (err) {
+            logErrorToSlack('error', { category: 'cron', action: 'report_autoskip.exception', message: err.message, module: 'scheduler' });
+        }
+    });
+
     // Inspection reminders — daily at 8am (Chile time UTC-3 = 11:00 UTC)
     cron.schedule('0 11 * * *', async () => {
         console.log('⏰ Cron: Inspection reminders check');
