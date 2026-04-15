@@ -155,20 +155,48 @@ router.post('/callback', authMiddleware, async (req, res) => {
     }
 });
 
+// Helper: log to system_audit_logs
+async function logAudit({ level, action, message, user_id, user_email, details }) {
+    try {
+        await pool.query(
+            `INSERT INTO system_audit_logs (level, category, action, module, message, user_id, user_email, details, path)
+             VALUES ($1, 'backend', $2, 'gmail', $3, $4, $5, $6, '/api/gmail/send')`,
+            [level, action, message, user_id || null, user_email || null, details ? JSON.stringify(details) : null]
+        );
+    } catch (err) {
+        console.error('[Audit Log] Failed to write:', err.message);
+    }
+}
+
 // POST /api/gmail/send — Send email via Gmail API (waits for real delivery confirmation)
 router.post('/send', authMiddleware, async (req, res) => {
     try {
         const agentId = req.user.id;
+        const userEmail = req.user.email;
         const emailData = req.body;
+
+        // Log: request received
+        await logAudit({
+            level: 'info', action: 'gmail.send.request',
+            message: `Solicitud de envío de correo a ${emailData.to}`,
+            user_id: agentId, user_email: userEmail,
+            details: { to: emailData.to, subject: emailData.subject, has_attachments: !!(emailData.attachments?.length), cc: emailData.cc || null },
+        });
 
         // 1. Check Redis is reachable before queueing
         try {
             await emailQueue.client.ping();
         } catch (redisErr) {
             console.error('[Gmail Send] Redis not reachable:', redisErr.message);
+            await logAudit({
+                level: 'error', action: 'gmail.send.redis_down',
+                message: `Redis no disponible al intentar enviar correo a ${emailData.to}`,
+                user_id: agentId, user_email: userEmail,
+                details: { to: emailData.to, subject: emailData.subject, error: redisErr.message },
+            });
             logErrorToSlack('error', {
                 category: 'backend', action: 'gmail.send.redis_down', message: `Redis unreachable: ${redisErr.message}`,
-                module: 'gmail', user_email: req.user.email,
+                module: 'gmail', user_email: userEmail,
             });
             return res.status(503).json({ error: 'El servicio de correo no está disponible en este momento. Intenta de nuevo en unos segundos.' });
         }
@@ -178,9 +206,9 @@ router.post('/send', authMiddleware, async (req, res) => {
             agentId,
             ...emailData,
         }, {
-            attempts: 1, // No retries — we want immediate feedback
-            removeOnComplete: { age: 300 }, // keep for 5 min for debugging
-            removeOnFail: { age: 600 },     // keep failed for 10 min
+            attempts: 1,
+            removeOnComplete: { age: 300 },
+            removeOnFail: { age: 600 },
         });
 
         // 3. Wait for the worker to process the job (timeout 30s)
@@ -191,36 +219,68 @@ router.post('/send', authMiddleware, async (req, res) => {
                 new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), SEND_TIMEOUT_MS + 1000)),
             ]);
             console.log(`✅ [Gmail Send] Email confirmed sent, Gmail ID: ${result?.id || 'unknown'}`);
+
+            // Log: success
+            await logAudit({
+                level: 'info', action: 'gmail.send.success',
+                message: `Correo enviado exitosamente a ${emailData.to}`,
+                user_id: agentId, user_email: userEmail,
+                details: { to: emailData.to, subject: emailData.subject, gmail_message_id: result?.id, job_id: job.id },
+            });
+
             res.json({ success: true, message: 'Correo enviado exitosamente', gmailMessageId: result?.id });
         } catch (waitErr) {
             if (waitErr.message === 'TIMEOUT') {
-                // Job is still processing — could be slow network
                 console.warn('[Gmail Send] Job timed out after 30s, checking state...');
                 const state = await job.getState();
                 if (state === 'completed') {
+                    await logAudit({
+                        level: 'warning', action: 'gmail.send.slow_success',
+                        message: `Correo a ${emailData.to} enviado con delay (timeout pero completado)`,
+                        user_id: agentId, user_email: userEmail,
+                        details: { to: emailData.to, subject: emailData.subject, job_id: job.id },
+                    });
                     res.json({ success: true, message: 'Correo enviado exitosamente' });
                 } else {
+                    await logAudit({
+                        level: 'error', action: 'gmail.send.timeout',
+                        message: `Timeout al enviar correo a ${emailData.to} (estado: ${state})`,
+                        user_id: agentId, user_email: userEmail,
+                        details: { to: emailData.to, subject: emailData.subject, job_state: state, job_id: job.id },
+                    });
                     logErrorToSlack('error', {
-                        category: 'backend', action: 'gmail.send.timeout', 
+                        category: 'backend', action: 'gmail.send.timeout',
                         message: `Email send timed out (state: ${state}), to: ${emailData.to}`,
-                        module: 'gmail', user_email: req.user.email,
+                        module: 'gmail', user_email: userEmail,
                     });
                     res.status(504).json({ error: 'El envío del correo tardó demasiado. Verifica en tu Gmail si fue enviado.' });
                 }
             } else {
-                // Job failed — worker threw an error
                 const failReason = waitErr.message || 'Error desconocido al enviar';
                 console.error('[Gmail Send] Job failed:', failReason);
+
+                // Log: failure
+                await logAudit({
+                    level: 'error', action: 'gmail.send.failed',
+                    message: `Error al enviar correo a ${emailData.to}: ${failReason}`,
+                    user_id: agentId, user_email: userEmail,
+                    details: { to: emailData.to, subject: emailData.subject, error: failReason, job_id: job.id },
+                });
                 logErrorToSlack('error', {
-                    category: 'backend', action: 'gmail.send.failed', 
+                    category: 'backend', action: 'gmail.send.failed',
                     message: `Email send failed: ${failReason}`,
-                    module: 'gmail', user_email: req.user.email,
+                    module: 'gmail', user_email: userEmail,
                     details: { to: emailData.to, subject: emailData.subject },
                 });
                 res.status(500).json({ error: `Error al enviar el correo: ${failReason}` });
             }
         }
     } catch (error) {
+        await logAudit({
+            level: 'error', action: 'gmail.send.exception',
+            message: `Excepción al procesar envío de correo: ${error.message}`,
+            details: { error: error.message, stack: error.stack?.substring(0, 500) },
+        });
         logErrorToSlack('error', {
             category: 'backend', action: 'gmail.send', message: error.message,
             module: 'gmail',

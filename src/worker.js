@@ -1,8 +1,22 @@
 import { Worker } from 'bullmq';
 import { redisConnection } from './lib/redis.js';
 import supabaseAdmin from './lib/supabaseAdmin.js';
+import pool from './lib/db.js';
 import { startCronJobs } from './cron/scheduler.js';
 import crypto from 'crypto';
+
+// Helper: log worker events to system_audit_logs
+async function logWorkerAudit({ level, action, message, user_id, user_email, details }) {
+    try {
+        await pool.query(
+            `INSERT INTO system_audit_logs (level, category, action, module, message, user_id, user_email, details, path)
+             VALUES ($1, 'worker', $2, 'gmail', $3, $4, $5, $6, 'worker/email')`,
+            [level, action, message, user_id || null, user_email || null, details ? JSON.stringify(details) : null]
+        );
+    } catch (err) {
+        console.error('[Worker Audit] Failed to write:', err.message);
+    }
+}
 
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -40,7 +54,7 @@ new Worker('email', async (job) => {
     const { agentId, to, subject, body, bodyHtml, cc, bcc, inReplyTo, threadId, attachments } = job.data;
     // Support both 'body' and 'bodyHtml' field names (frontend sends 'bodyHtml')
     let htmlBody = bodyHtml || body;
-    console.log(`📧 Sending email to ${to}...`);
+    console.log(`📧 [Worker] Processing email job ${job.id} to ${to}...`);
 
     const { data: account } = await supabaseAdmin
         .from('gmail_accounts')
@@ -48,7 +62,15 @@ new Worker('email', async (job) => {
         .eq('agent_id', agentId)
         .single();
 
-    if (!account) throw new Error(`No Gmail account for agent ${agentId}`);
+    if (!account) {
+        await logWorkerAudit({
+            level: 'error', action: 'worker.email.no_account',
+            message: `No se encontró cuenta Gmail para agente ${agentId}`,
+            user_id: agentId,
+            details: { to, subject, job_id: job.id },
+        });
+        throw new Error(`No Gmail account for agent ${agentId}`);
+    }
 
     // Fetch agent's email signature image
     const { data: agentProfile } = await supabaseAdmin
@@ -114,11 +136,26 @@ new Worker('email', async (job) => {
 
     if (!response.ok) {
         const errText = await response.text();
+        await logWorkerAudit({
+            level: 'error', action: 'worker.email.gmail_api_error',
+            message: `Gmail API rechazó el envío a ${to}: HTTP ${response.status}`,
+            user_id: agentId, user_email: account.email_address,
+            details: { to, subject, from: account.email_address, status: response.status, error: errText?.substring(0, 500), job_id: job.id },
+        });
         throw new Error(`Gmail send failed: ${response.status} ${errText}`);
     }
 
     const result = await response.json();
-    console.log(`✅ Email sent: ${result.id}`);
+    console.log(`✅ [Worker] Email sent: ${result.id} (from: ${account.email_address} → to: ${to})`);
+
+    // Log: successful delivery by worker
+    await logWorkerAudit({
+        level: 'info', action: 'worker.email.delivered',
+        message: `Email entregado a Gmail: ${account.email_address} → ${to}`,
+        user_id: agentId, user_email: account.email_address,
+        details: { to, from: account.email_address, subject, gmail_message_id: result.id, tracking_id: trackingId, job_id: job.id },
+    });
+
     return result;
 }, { connection: redisConnection, concurrency: 5 });
 
