@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import pool from '../lib/db.js';
-import { emailQueue } from '../queues/index.js';
+import { emailQueue, emailQueueEvents } from '../queues/index.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
@@ -155,21 +155,71 @@ router.post('/callback', authMiddleware, async (req, res) => {
     }
 });
 
-// POST /api/gmail/send — Send email via Gmail API
+// POST /api/gmail/send — Send email via Gmail API (waits for real delivery confirmation)
 router.post('/send', authMiddleware, async (req, res) => {
     try {
         const agentId = req.user.id;
         const emailData = req.body;
 
-        await emailQueue.add('send-email', {
+        // 1. Check Redis is reachable before queueing
+        try {
+            await emailQueue.client.ping();
+        } catch (redisErr) {
+            console.error('[Gmail Send] Redis not reachable:', redisErr.message);
+            logErrorToSlack('error', {
+                category: 'backend', action: 'gmail.send.redis_down', message: `Redis unreachable: ${redisErr.message}`,
+                module: 'gmail', user_email: req.user.email,
+            });
+            return res.status(503).json({ error: 'El servicio de correo no está disponible en este momento. Intenta de nuevo en unos segundos.' });
+        }
+
+        // 2. Queue the job and wait for completion (max 30s)
+        const job = await emailQueue.add('send-email', {
             agentId,
             ...emailData,
         }, {
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 5000 },
+            attempts: 1, // No retries — we want immediate feedback
+            removeOnComplete: { age: 300 }, // keep for 5 min for debugging
+            removeOnFail: { age: 600 },     // keep failed for 10 min
         });
 
-        res.json({ success: true, message: 'Email queued for sending' });
+        // 3. Wait for the worker to process the job (timeout 30s)
+        const SEND_TIMEOUT_MS = 30000;
+        try {
+            const result = await Promise.race([
+                job.waitUntilFinished(emailQueueEvents, SEND_TIMEOUT_MS),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), SEND_TIMEOUT_MS + 1000)),
+            ]);
+            console.log(`✅ [Gmail Send] Email confirmed sent, Gmail ID: ${result?.id || 'unknown'}`);
+            res.json({ success: true, message: 'Correo enviado exitosamente', gmailMessageId: result?.id });
+        } catch (waitErr) {
+            if (waitErr.message === 'TIMEOUT') {
+                // Job is still processing — could be slow network
+                console.warn('[Gmail Send] Job timed out after 30s, checking state...');
+                const state = await job.getState();
+                if (state === 'completed') {
+                    res.json({ success: true, message: 'Correo enviado exitosamente' });
+                } else {
+                    logErrorToSlack('error', {
+                        category: 'backend', action: 'gmail.send.timeout', 
+                        message: `Email send timed out (state: ${state}), to: ${emailData.to}`,
+                        module: 'gmail', user_email: req.user.email,
+                    });
+                    res.status(504).json({ error: 'El envío del correo tardó demasiado. Verifica en tu Gmail si fue enviado.' });
+                }
+            } else {
+                // Job failed — worker threw an error
+                const failReason = waitErr.message || 'Error desconocido al enviar';
+                console.error('[Gmail Send] Job failed:', failReason);
+                logErrorToSlack('error', {
+                    category: 'backend', action: 'gmail.send.failed', 
+                    message: `Email send failed: ${failReason}`,
+                    module: 'gmail', user_email: req.user.email,
+                    details: { to: emailData.to, subject: emailData.subject },
+                });
+                res.status(500).json({ error: `Error al enviar el correo: ${failReason}` });
+            }
+        }
     } catch (error) {
         logErrorToSlack('error', {
             category: 'backend', action: 'gmail.send', message: error.message,

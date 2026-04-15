@@ -1,9 +1,10 @@
-import { Queue } from 'bullmq';
+import { Queue, QueueEvents } from 'bullmq';
 import { redisConnection } from '../lib/redis.js';
 
 const defaultOpts = { connection: redisConnection };
 
 export const emailQueue = new Queue('email', defaultOpts);
+export const emailQueueEvents = new QueueEvents('email', { connection: redisConnection });
 export const calendarQueue = new Queue('calendar', defaultOpts);
 export const importQueue = new Queue('import', defaultOpts);
 export const notificationQueue = new Queue('notification', defaultOpts);
