@@ -14,10 +14,18 @@ const MINIO_PORT = process.env.MINIO_PORT || '9000';
 const MINIO_ACCESS_KEY = process.env.MINIO_ROOT_USER || process.env.MINIO_ACCESS_KEY || 'minioadmin';
 const MINIO_SECRET_KEY = process.env.MINIO_ROOT_PASSWORD || process.env.MINIO_SECRET_KEY || 'minioadmin';
 const SIGN_SECRET = process.env.GOTRUE_JWT_SECRET || 'storage-sign-secret';
+const MINIO_USE_SSL = process.env.MINIO_USE_SSL === 'true';
+const MINIO_PROTOCOL = MINIO_USE_SSL ? 'https' : 'http';
+// For SSL on port 443, omit the port in the URL
+const MINIO_URL = (MINIO_USE_SSL && MINIO_PORT === '443')
+    ? `${MINIO_PROTOCOL}://${MINIO_ENDPOINT}`
+    : `${MINIO_PROTOCOL}://${MINIO_ENDPOINT}:${MINIO_PORT}`;
+
+console.log(`[Storage] MinIO endpoint: ${MINIO_URL} (SSL=${MINIO_USE_SSL})`);
 
 const s3 = new S3Client({
     region: 'us-east-1',
-    endpoint: `http://${MINIO_ENDPOINT}:${MINIO_PORT}`,
+    endpoint: MINIO_URL,
     forcePathStyle: true,
     credentials: {
         accessKeyId: MINIO_ACCESS_KEY,
