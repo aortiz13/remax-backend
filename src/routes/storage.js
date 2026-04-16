@@ -165,42 +165,9 @@ router.get('/object/sign/:bucket/*', async (req, res) => {
     }
 });
 
-// GET /storage/v1/object/:bucket/*path — Download file (used by supabase.storage.download())
-// MUST be after /object/sign/ and /object/public/ routes
-router.get('/object/:bucket/*', authMiddleware, async (req, res) => {
-    try {
-        const bucket = normalizeBucket(req.params.bucket);
-        const key = req.params[0];
-
-        console.log(`[Storage] Download: bucket=${bucket}, key=${key}`);
-        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-        const response = await s3.send(command);
-
-        const ext = key.split('.').pop()?.toLowerCase();
-        const contentTypes = {
-            pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-            gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
-            doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            xlsm: 'application/vnd.ms-excel.sheet.macroEnabled.12',
-            mp4: 'video/mp4', mp3: 'audio/mpeg',
-            zip: 'application/zip', txt: 'text/plain', csv: 'text/csv',
-        };
-
-        res.set('Content-Type', response.ContentType || contentTypes[ext] || 'application/octet-stream');
-        if (response.ContentLength) res.set('Content-Length', String(response.ContentLength));
-        res.removeHeader('X-Frame-Options');
-        res.set('Content-Disposition', 'inline');
-
-        response.Body.pipe(res);
-    } catch (error) {
-        logErrorToSlack('warning', {
-            category: 'backend', action: 'storage.download', message: error.message,
-            module: 'storage',
-        });
-        res.status(404).json({ error: 'File not found', details: error.message });
-    }
-});
+// NOTE: GET /object/:bucket/* (authenticated download) is defined AFTER
+// /object/public/ and /object/sign/ routes to prevent Express matching
+// "public" or "sign" as the :bucket parameter.
 
 // Helper: extract file from request (handles both multipart FormData and raw body)
 function extractFileFromRequest(req) {
@@ -366,6 +333,43 @@ router.get('/object/authenticated/:bucket/*', authMiddleware, async (req, res) =
             module: 'storage',
         });
         res.status(404).json({ error: 'File not found' });
+    }
+});
+
+// GET /storage/v1/object/:bucket/*path — Catch-all download (used by supabase.storage.download())
+// MUST be LAST among GET /object/* routes so it doesn't shadow /object/public/ or /object/sign/
+router.get('/object/:bucket/*', authMiddleware, async (req, res) => {
+    try {
+        const bucket = normalizeBucket(req.params.bucket);
+        const key = req.params[0];
+
+        console.log(`[Storage] Download: bucket=${bucket}, key=${key}`);
+        const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+        const response = await s3.send(command);
+
+        const ext = key.split('.').pop()?.toLowerCase();
+        const contentTypes = {
+            pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+            gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml',
+            doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            xlsm: 'application/vnd.ms-excel.sheet.macroEnabled.12',
+            mp4: 'video/mp4', mp3: 'audio/mpeg',
+            zip: 'application/zip', txt: 'text/plain', csv: 'text/csv',
+        };
+
+        res.set('Content-Type', response.ContentType || contentTypes[ext] || 'application/octet-stream');
+        if (response.ContentLength) res.set('Content-Length', String(response.ContentLength));
+        res.removeHeader('X-Frame-Options');
+        res.set('Content-Disposition', 'inline');
+
+        response.Body.pipe(res);
+    } catch (error) {
+        logErrorToSlack('warning', {
+            category: 'backend', action: 'storage.download', message: error.message,
+            module: 'storage',
+        });
+        res.status(404).json({ error: 'File not found', details: error.message });
     }
 });
 
