@@ -1,10 +1,13 @@
+import { createServer } from 'http';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import { WebSocketServer } from 'ws';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import pool from './lib/db.js';
 import redis from './lib/redis.js';
 import { logErrorToSlack } from './middleware/slackErrorLogger.js';
+import { handleLlmWebSocket } from './llm/wsHandler.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -25,6 +28,8 @@ import guardLeadsRoutes from './routes/guardLeads.js';
 import trackingRoutes from './routes/tracking.js';
 import meetingsRoutes from './routes/meetings.js';
 import meetingBotRoutes from './routes/meetingBot.js';
+import voiceRoutes from './routes/voice.js';
+import voiceCampaignsRoutes from './routes/voiceCampaigns.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -152,7 +157,10 @@ app.use(helmet({
     crossOriginOpenerPolicy: false,
     crossOriginEmbedderPolicy: false,
 }));
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({
+    limit: '50mb',
+    verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); },
+}));
 
 // Storage routes mounted above (before body parser)
 
@@ -206,6 +214,8 @@ app.use('/api/guard-leads', guardLeadsRoutes);
 app.use('/api/tracking', trackingRoutes);
 app.use('/api/meetings', meetingsRoutes);
 app.use('/api/meeting-bot', meetingBotRoutes);
+app.use('/api/voice', voiceRoutes);
+app.use('/api/voice/campaigns', voiceCampaignsRoutes);
 
 // Legacy Supabase Edge Function path fallback
 // Maps /functions/v1/<name> → /api/<route> for old frontend clients
@@ -246,9 +256,17 @@ app.use((err, req, res, next) => {
     res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+// HTTP server (shared with WebSocket)
+const server = createServer(app);
+
+// WebSocket server for Retell Custom LLM — path /llm-websocket
+const wss = new WebSocketServer({ server, path: '/llm-websocket' });
+wss.on('connection', handleLlmWebSocket);
+
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 RE/MAX API Gateway running on port ${PORT}`);
-    console.log(`   Auth → ${GOTRUE_URL}`);
-    console.log(`   REST → ${POSTGREST_URL}`);
+    console.log(`   Auth    → ${GOTRUE_URL}`);
+    console.log(`   REST    → ${POSTGREST_URL}`);
     console.log(`   Storage → ${MINIO_INTERNAL_URL}`);
+    console.log(`   Voice LLM WebSocket → ws://0.0.0.0:${PORT}/llm-websocket`);
 });

@@ -3,6 +3,7 @@ import { calendarQueue, importQueue, youtubeQueue, cameraReminderQueue, cleanupQ
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import pool from '../lib/db.js';
+import { runCampaignCalls } from '../routes/voiceCampaigns.js';
 
 export function startCronJobs() {
     // Calendar sync — every 15 minutes
@@ -830,6 +831,28 @@ export function startCronJobs() {
         } catch (err) {
             console.error('❌ Birthday reminder cron error:', err.message);
             logErrorToSlack('error', { category: 'cron', action: 'birthday_reminder.check', message: err.message, module: 'scheduler' });
+        }
+    });
+
+    // ── Voice Agent: campañas salientes programadas — cada minuto ──
+    cron.schedule('* * * * *', async () => {
+        try {
+            const { rows: campaigns } = await pool.query(
+                `SELECT * FROM outbound_campaigns WHERE status = 'scheduled' AND scheduled_at <= NOW()`
+            );
+            for (const campaign of campaigns) {
+                await pool.query(`UPDATE outbound_campaigns SET status = 'running' WHERE id = $1`, [campaign.id]);
+                const { rows: contacts } = await pool.query(
+                    `SELECT * FROM campaign_contacts WHERE campaign_id = $1 AND call_status = 'pending'`,
+                    [campaign.id]
+                );
+                console.log(`⏰ Voice campaign "${campaign.name}" starting — ${contacts.length} contacts`);
+                runCampaignCalls(campaign, contacts).catch(err =>
+                    logErrorToSlack('error', { category: 'voice-agent', action: 'cron.campaign', message: err.message })
+                );
+            }
+        } catch (err) {
+            logErrorToSlack('error', { category: 'voice-agent', action: 'cron.campaigns', message: err.message });
         }
     });
 
