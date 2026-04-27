@@ -117,7 +117,7 @@ const buildConfig = (voice_id) => ({
     webhook_url: `${BASE}/api/voice/webhook`,
     post_call_analysis_data: [
         {
-            type: 'selector',
+            type: 'enum',
             name: 'intent',
             description: 'Intención principal de la llamada del cliente.',
             choices: ['compra', 'arriendo', 'venta', 'administracion', 'consulta_pago', 'reclamo', 'informacion_general', 'otro'],
@@ -148,7 +148,7 @@ const buildConfig = (voice_id) => ({
             description: 'Presupuesto o monto mencionado por el cliente, si lo dio.',
         },
         {
-            type: 'selector',
+            type: 'enum',
             name: 'urgency',
             description: 'Urgencia percibida del contacto.',
             choices: ['alta', 'normal', 'baja'],

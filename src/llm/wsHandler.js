@@ -3,7 +3,16 @@ import pool from '../lib/db.js';
 import { INBOUND_SYSTEM_PROMPT, DEBT_COLLECTION_PROMPT } from './systemPrompt.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+let _anthropic;
+function anthropicClient() {
+    if (!_anthropic) {
+        if (!process.env.ANTHROPIC_API_KEY) {
+            throw new Error('ANTHROPIC_API_KEY is not set in environment');
+        }
+        _anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    }
+    return _anthropic;
+}
 
 const TOOLS = [
     {
@@ -195,7 +204,7 @@ export function handleLlmWebSocket(ws, req) {
 
         let response;
         try {
-            response = await anthropic.messages.create({
+            response = await anthropicClient().messages.create({
                 model: 'claude-sonnet-4-6',
                 max_tokens: 512,
                 system: systemPrompt,
@@ -224,7 +233,7 @@ export function handleLlmWebSocket(ws, req) {
                 if (tool.name === 'transferToHuman' && result.transfer_to) transferPhone = result.transfer_to;
             }
 
-            const followUp = await anthropic.messages.create({
+            const followUp = await anthropicClient().messages.create({
                 model: 'claude-sonnet-4-6',
                 max_tokens: 256,
                 system: systemPrompt,
