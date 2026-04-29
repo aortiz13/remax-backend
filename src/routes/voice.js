@@ -153,16 +153,28 @@ router.get('/calls/:id', authMiddleware, async (req, res) => {
 
 // POST /api/voice/tool — Retell LLM custom tool callback (no HMAC — retell-llm uses different auth)
 router.post('/tool', async (req, res) => {
-    const { call, name: toolName, args = {} } = req.body;
-    if (!toolName) return res.status(400).json({ result: 'Missing tool name' });
+    const rawBody = req.body;
+    console.log('[voice/tool] FULL BODY:', JSON.stringify(rawBody, null, 2));
+
+    const { call, name: toolName, args = {} } = rawBody;
+    const callId = call?.call_id || null;
+
+    console.log(`[voice/tool] tool="${toolName}" call_id="${callId}" args=${JSON.stringify(args)}`);
+
+    if (!toolName) {
+        console.log('[voice/tool] ERROR: missing tool name');
+        return res.status(400).json({ result: 'Missing tool name' });
+    }
 
     try {
-        const outcome = await executeTool(toolName, args, call?.call_id || null);
+        const outcome = await executeTool(toolName, args, callId);
+        console.log(`[voice/tool] outcome for "${toolName}":`, JSON.stringify(outcome));
         const message = outcome.success
             ? toolResultMessage(toolName, args)
             : `No se pudo completar la acción: ${outcome.error || 'error desconocido'}`;
         res.json({ result: message });
     } catch (err) {
+        console.log(`[voice/tool] EXCEPTION for "${toolName}":`, err.message, err.stack);
         logErrorToSlack('error', { category: 'voice-agent', action: `tool.${toolName}`, message: err.message });
         res.status(500).json({ result: 'Error al ejecutar la acción' });
     }
