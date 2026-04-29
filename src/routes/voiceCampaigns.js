@@ -140,6 +140,7 @@ async function runCampaignCalls(campaign, contacts) {
         try {
             await createOutboundCall({
                 toPhone: contact.phone,
+                agentId: process.env.RETELL_DEBT_AGENT_ID || process.env.RETELL_AGENT_ID,
                 metadata: {
                     campaign_id: campaign.id,
                     contact_id: contact.id,
@@ -148,7 +149,14 @@ async function runCampaignCalls(campaign, contacts) {
                     debt_amount: contact.debt_amount,
                     debt_months: contact.debt_months,
                     manager_name: contact.manager_name,
-                }
+                },
+                dynamicVariables: {
+                    contact_name: contact.name || '',
+                    property_address: contact.property_address || '',
+                    debt_amount: String(Number(contact.debt_amount || 0).toLocaleString('es-CL')),
+                    debt_months: String(contact.debt_months || 0),
+                    manager_name: contact.manager_name || 'RE/MAX Exclusive',
+                },
             });
             await pool.query(`UPDATE campaign_contacts SET call_status = 'called' WHERE id = $1`, [contact.id]);
             answered++;

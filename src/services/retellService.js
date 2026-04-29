@@ -11,13 +11,15 @@ function client() {
     return _retell;
 }
 
-export async function createOutboundCall({ toPhone, metadata = {} }) {
-    return client().call.createPhoneCall({
+export async function createOutboundCall({ toPhone, metadata = {}, agentId, dynamicVariables }) {
+    const payload = {
         from_number: process.env.TWILIO_PHONE_NUMBER,
         to_number: toPhone,
-        agent_id: process.env.RETELL_AGENT_ID,
+        agent_id: agentId || process.env.RETELL_AGENT_ID,
         metadata,
-    });
+    };
+    if (dynamicVariables) payload.retell_llm_dynamic_variables = dynamicVariables;
+    return client().call.createPhoneCall(payload);
 }
 
 export async function getRetellCall(callId) {

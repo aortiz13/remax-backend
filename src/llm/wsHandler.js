@@ -91,7 +91,7 @@ async function getCallDbId(retellCallId) {
     return rows[0]?.id || null;
 }
 
-async function executeTool(toolName, toolArgs, retellCallId) {
+export async function executeTool(toolName, toolArgs, retellCallId) {
     try {
         const callId = await getCallDbId(retellCallId);
 

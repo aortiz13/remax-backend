@@ -3,6 +3,7 @@ import Retell from 'retell-sdk';
 import pool from '../lib/db.js';
 import authMiddleware from '../middleware/auth.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
+import { executeTool } from '../llm/wsHandler.js';
 
 const router = Router();
 
@@ -150,5 +151,42 @@ router.get('/calls/:id', authMiddleware, async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// POST /api/voice/tool — Retell LLM webhook tool callback (no user auth, verified by HMAC)
+router.post('/tool', async (req, res) => {
+    const secret = process.env.RETELL_WEBHOOK_SECRET;
+    if (secret) {
+        const sig = req.headers['x-retell-signature'];
+        if (!sig || !req.rawBody) return res.status(401).json({ result: 'Missing signature' });
+        if (!Retell.verify(req.rawBody, secret, sig)) {
+            return res.status(401).json({ result: 'Invalid signature' });
+        }
+    }
+
+    const { call, name: toolName, args = {} } = req.body;
+    if (!toolName) return res.status(400).json({ result: 'Missing tool name' });
+
+    try {
+        const outcome = await executeTool(toolName, args, call?.call_id || null);
+        const message = outcome.success
+            ? toolResultMessage(toolName, args)
+            : `No se pudo completar la acción: ${outcome.error || 'error desconocido'}`;
+        res.json({ result: message });
+    } catch (err) {
+        logErrorToSlack('error', { category: 'voice-agent', action: `tool.${toolName}`, message: err.message });
+        res.status(500).json({ result: 'Error al ejecutar la acción' });
+    }
+});
+
+function toolResultMessage(toolName, args) {
+    switch (toolName) {
+        case 'captureLead': return `Lead guardado: ${args.name || ''} (${args.operation_type || ''})`;
+        case 'sendWhatsAppToRemax': return 'WhatsApp enviado al equipo de RE/MAX';
+        case 'sendWhatsAppToClient': return 'WhatsApp de confirmación enviado al cliente';
+        case 'sendEmail': return 'Email enviado al equipo de RE/MAX';
+        case 'transferToHuman': return 'Transfiriendo a agente humano';
+        default: return 'Acción completada';
+    }
+}
 
 export default router;
