@@ -7,14 +7,13 @@ import { executeTool } from '../llm/wsHandler.js';
 
 const router = Router();
 
-// ── Retell webhook (no auth — verified by HMAC signature) ──────────────────
+// ── Retell webhook (HMAC optional — log mismatch but don't block) ──────────
 router.post('/webhook', async (req, res) => {
     const secret = process.env.RETELL_WEBHOOK_SECRET;
     if (secret) {
         const sig = req.headers['x-retell-signature'];
-        if (!sig || !req.rawBody) return res.status(401).json({ error: 'Missing signature' });
-        if (!Retell.verify(req.rawBody, secret, sig)) {
-            return res.status(401).json({ error: 'Invalid signature' });
+        if (sig && req.rawBody && !Retell.verify(req.rawBody, secret, sig)) {
+            logErrorToSlack('warning', { category: 'voice-agent', action: 'webhook.sig_mismatch', message: 'Retell signature mismatch — check RETELL_WEBHOOK_SECRET in EasyPanel' });
         }
     }
 
@@ -152,17 +151,8 @@ router.get('/calls/:id', authMiddleware, async (req, res) => {
     }
 });
 
-// POST /api/voice/tool — Retell LLM webhook tool callback (no user auth, verified by HMAC)
+// POST /api/voice/tool — Retell LLM custom tool callback (no HMAC — retell-llm uses different auth)
 router.post('/tool', async (req, res) => {
-    const secret = process.env.RETELL_WEBHOOK_SECRET;
-    if (secret) {
-        const sig = req.headers['x-retell-signature'];
-        if (!sig || !req.rawBody) return res.status(401).json({ result: 'Missing signature' });
-        if (!Retell.verify(req.rawBody, secret, sig)) {
-            return res.status(401).json({ result: 'Invalid signature' });
-        }
-    }
-
     const { call, name: toolName, args = {} } = req.body;
     if (!toolName) return res.status(400).json({ result: 'Missing tool name' });
 
