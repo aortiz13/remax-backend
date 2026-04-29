@@ -149,7 +149,15 @@ export async function executeTool(toolName, toolArgs, retellCallId) {
                     const resp = await fetch(n8nUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ type: 'voice_agent_notification', priority: args.priority || 'normal', message: args.message, timestamp: new Date().toISOString() })
+                        body: JSON.stringify({
+                            type: 'voice_agent_notification',
+                            operation_type: args.operation_type || null,
+                            priority: args.priority || 'normal',
+                            lead_name: args.lead_name || null,
+                            lead_phone: args.lead_phone || null,
+                            message: args.message,
+                            timestamp: new Date().toISOString()
+                        })
                     });
                     console.log(`[executeTool] sendWhatsAppToRemax n8n response: ${resp.status}`);
                 }
