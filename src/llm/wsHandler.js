@@ -91,30 +91,50 @@ async function getCallDbId(retellCallId) {
     return rows[0]?.id || null;
 }
 
+async function ensureCallRecord(retellCallId) {
+    if (!retellCallId) return null;
+    let callId = await getCallDbId(retellCallId);
+    if (!callId) {
+        console.log(`[executeTool] call_id not in DB for "${retellCallId}", creating fallback record`);
+        await pool.query(
+            `INSERT INTO voice_calls (retell_call_id, direction, status, created_at)
+             VALUES ($1, 'inbound', 'ongoing', NOW())
+             ON CONFLICT (retell_call_id) DO NOTHING`,
+            [retellCallId]
+        );
+        const { rows } = await pool.query('SELECT id FROM voice_calls WHERE retell_call_id = $1', [retellCallId]);
+        callId = rows[0]?.id || null;
+        console.log(`[executeTool] fallback call record id=${callId}`);
+    }
+    return callId;
+}
+
 export async function executeTool(toolName, toolArgs, retellCallId) {
-    console.log(`[executeTool] START tool="${toolName}" retell_call_id="${retellCallId}" args=${JSON.stringify(toolArgs)}`);
+    // Strip Retell internal fields from args
+    const { execution_message, ...args } = toolArgs;
+    console.log(`[executeTool] START tool="${toolName}" retell_call_id="${retellCallId}" args=${JSON.stringify(args)}`);
     try {
-        const callId = await getCallDbId(retellCallId);
+        const callId = await ensureCallRecord(retellCallId);
         console.log(`[executeTool] db call_id=${callId} (from retell_call_id="${retellCallId}")`);
 
         switch (toolName) {
             case 'captureLead': {
-                console.log('[executeTool] captureLead args:', JSON.stringify(toolArgs));
-                if (!callId) {
-                    console.log('[executeTool] captureLead: no callId in DB — call_started webhook may have failed');
+                console.log('[executeTool] captureLead args:', JSON.stringify(args));
+                if (!args.name || !args.phone || !args.operation_type) {
+                    console.log('[executeTool] captureLead: MISSING required fields — name/phone/operation_type not in args. Full toolArgs was:', JSON.stringify(toolArgs));
                 }
                 if (callId) {
                     await pool.query(
                         `INSERT INTO call_leads (call_id, name, phone, email, operation_type, property_interest, budget_range, additional_info)
                          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-                        [callId, toolArgs.name, toolArgs.phone, toolArgs.email || null,
-                            toolArgs.operation_type, toolArgs.property_interest || null,
-                            toolArgs.budget_range || null, JSON.stringify({ notes: toolArgs.notes })]
+                        [callId, args.name || null, args.phone || null, args.email || null,
+                            args.operation_type || 'consulta', args.property_interest || null,
+                            args.budget_range || null, JSON.stringify({ notes: args.notes })]
                     );
                     console.log('[executeTool] captureLead: INSERT call_leads OK');
                     await pool.query(
                         `INSERT INTO call_actions (call_id, action_type, action_data) VALUES ($1, 'lead_captured', $2)`,
-                        [callId, JSON.stringify(toolArgs)]
+                        [callId, JSON.stringify(args)]
                     );
                     console.log('[executeTool] captureLead: INSERT call_actions OK');
                 }
@@ -122,59 +142,59 @@ export async function executeTool(toolName, toolArgs, retellCallId) {
             }
 
             case 'sendWhatsAppToRemax': {
-                console.log('[executeTool] sendWhatsAppToRemax args:', JSON.stringify(toolArgs));
+                console.log('[executeTool] sendWhatsAppToRemax args:', JSON.stringify(args));
                 const n8nUrl = process.env.N8N_WHATSAPP_WEBHOOK_URL || process.env.N8N_WEBHOOK_URL;
                 console.log(`[executeTool] sendWhatsAppToRemax n8n_url="${n8nUrl || 'NOT SET'}"`);
                 if (n8nUrl) {
                     const resp = await fetch(n8nUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ type: 'voice_agent_notification', priority: toolArgs.priority || 'normal', message: toolArgs.message, timestamp: new Date().toISOString() })
+                        body: JSON.stringify({ type: 'voice_agent_notification', priority: args.priority || 'normal', message: args.message, timestamp: new Date().toISOString() })
                     });
                     console.log(`[executeTool] sendWhatsAppToRemax n8n response: ${resp.status}`);
                 }
                 if (callId) await pool.query(
                     `INSERT INTO call_actions (call_id, action_type, action_data) VALUES ($1, 'whatsapp_remax', $2)`,
-                    [callId, JSON.stringify(toolArgs)]
+                    [callId, JSON.stringify(args)]
                 );
                 return { success: true };
             }
 
             case 'sendWhatsAppToClient': {
-                console.log('[executeTool] sendWhatsAppToClient args:', JSON.stringify(toolArgs));
+                console.log('[executeTool] sendWhatsAppToClient args:', JSON.stringify(args));
                 const n8nUrl = process.env.N8N_WHATSAPP_WEBHOOK_URL || process.env.N8N_WEBHOOK_URL;
                 if (n8nUrl) {
                     const resp = await fetch(n8nUrl, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ type: 'client_confirmation', to: toolArgs.phone, message: toolArgs.message })
+                        body: JSON.stringify({ type: 'client_confirmation', to: args.phone, message: args.message })
                     });
                     console.log(`[executeTool] sendWhatsAppToClient n8n response: ${resp.status}`);
                 }
                 if (callId) await pool.query(
                     `INSERT INTO call_actions (call_id, action_type, action_data) VALUES ($1, 'whatsapp_client', $2)`,
-                    [callId, JSON.stringify(toolArgs)]
+                    [callId, JSON.stringify(args)]
                 );
                 return { success: true };
             }
 
             case 'sendEmail': {
-                console.log('[executeTool] sendEmail args:', JSON.stringify(toolArgs));
+                console.log('[executeTool] sendEmail args:', JSON.stringify(args));
                 const { sendAgentEmail } = await import('../services/voiceEmailService.js');
-                await sendAgentEmail(toolArgs);
+                await sendAgentEmail(args);
                 console.log('[executeTool] sendEmail: sent OK');
                 if (callId) await pool.query(
                     `INSERT INTO call_actions (call_id, action_type, action_data) VALUES ($1, 'email_sent', $2)`,
-                    [callId, JSON.stringify(toolArgs)]
+                    [callId, JSON.stringify(args)]
                 );
                 return { success: true };
             }
 
             case 'transferToHuman': {
-                console.log('[executeTool] transferToHuman args:', JSON.stringify(toolArgs));
+                console.log('[executeTool] transferToHuman args:', JSON.stringify(args));
                 if (callId) await pool.query(
                     `INSERT INTO call_actions (call_id, action_type, action_data) VALUES ($1, 'transfer', $2)`,
-                    [callId, JSON.stringify(toolArgs)]
+                    [callId, JSON.stringify(args)]
                 );
                 return { success: true, transfer_to: process.env.REMAX_TRANSFER_PHONE };
             }
