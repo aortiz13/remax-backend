@@ -70,3 +70,34 @@ export async function buildErrorDigest({ hours = 24, levels = ['error', 'warning
         generated_at: new Date().toISOString(),
     };
 }
+
+// Posts a digest produced by buildErrorDigest to the claude.ai rutina trigger.
+// Used by the daily cron and the manual trigger endpoint.
+// Returns { ok, skipped, status } — never leaks the URL / token to callers.
+export async function pushDigestToRutina(digest) {
+    const url = process.env.TRIAGE_RUTINA_URL;
+    const token = process.env.TRIAGE_RUTINA_TOKEN;
+
+    if (!url) {
+        return { ok: false, skipped: true, status: null, reason: 'not_configured' };
+    }
+    if (!digest || digest.unique_signatures === 0) {
+        return { ok: true, skipped: true, status: null, reason: 'empty_digest' };
+    }
+
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ digest }),
+    });
+
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`rutina trigger HTTP ${res.status}: ${body.slice(0, 200)}`);
+    }
+
+    return { ok: true, skipped: false, status: res.status };
+}
