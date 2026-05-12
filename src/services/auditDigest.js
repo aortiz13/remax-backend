@@ -91,7 +91,9 @@ export async function pushDigestToRutina(digest) {
             'Content-Type': 'application/json',
             ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
         },
-        body: JSON.stringify({ digest }),
+        // claude.ai rutina trigger API expects a single `input` string —
+        // the rutina prompt parses the JSON internally to read `digest.*`.
+        body: JSON.stringify({ input: JSON.stringify({ digest }) }),
     });
 
     if (!res.ok) {
