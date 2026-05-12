@@ -85,15 +85,22 @@ export async function pushDigestToRutina(digest) {
         return { ok: true, skipped: true, status: null, reason: 'empty_digest' };
     }
 
+    // Claude Code routines /fire API accepts a single freeform `text`
+    // field (≤65,536 chars). The routine prompt parses the JSON inside.
+    const payload = JSON.stringify({ digest });
+    const text = payload.length > 65000
+        ? payload.slice(0, 65000) + '\n... [truncated]'
+        : payload;
+
     const res = await fetch(url, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
+            'anthropic-version': '2023-06-01',
+            'anthropic-beta': 'experimental-cc-routine-2026-04-01',
             ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
         },
-        // claude.ai rutina trigger API expects a single `input` string —
-        // the rutina prompt parses the JSON internally to read `digest.*`.
-        body: JSON.stringify({ input: JSON.stringify({ digest }) }),
+        body: JSON.stringify({ text }),
     });
 
     if (!res.ok) {
