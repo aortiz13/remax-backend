@@ -1,5 +1,40 @@
 import pool from '../lib/db.js';
 
+// Posts a built digest to the claude.ai rutina trigger URL.
+// Shared between the daily cron push and the manual "Disparar triage"
+// button in the admin audit-logs page.
+//
+// Behavior:
+//   - returns { ok: false, skipped: true, reason: 'not_configured' } when TRIAGE_RUTINA_URL is empty
+//   - returns { ok: false, skipped: true, reason: 'empty_digest' } when digest has 0 signatures
+//   - throws on non-2xx response (with status + first 200 chars of body)
+//   - returns { ok: true, status } on success
+export async function pushDigestToRutina(digest) {
+    const url = process.env.TRIAGE_RUTINA_URL;
+    const token = process.env.TRIAGE_RUTINA_TOKEN;
+
+    if (!url) return { ok: false, skipped: true, reason: 'not_configured' };
+    if (!digest || digest.unique_signatures === 0) {
+        return { ok: false, skipped: true, reason: 'empty_digest' };
+    }
+
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ digest }),
+    });
+
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`rutina trigger HTTP ${res.status}: ${body.slice(0, 200)}`);
+    }
+
+    return { ok: true, skipped: false, status: res.status };
+}
+
 // Builds a grouped digest of recent system_audit_logs entries.
 // Shared between the HTTP endpoint (pull) and the cron push to the
 // claude.ai rutina, so signature semantics stay identical.

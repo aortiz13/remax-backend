@@ -1,5 +1,7 @@
 import { Router } from 'express';
-import { buildErrorDigest } from '../services/auditDigest.js';
+import authMiddleware from '../middleware/auth.js';
+import supabaseAdmin from '../lib/supabaseAdmin.js';
+import { buildErrorDigest, pushDigestToRutina } from '../services/auditDigest.js';
 
 const router = Router();
 
@@ -27,6 +29,48 @@ router.get('/errors-digest', requireInternalKey, async (req, res) => {
         res.json(digest);
     } catch (err) {
         console.error('errors-digest failed:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST /api/internal/triage/trigger-now
+// User-facing manual trigger for the same flow as the 8am cron.
+// Auth: GoTrue JWT + role check (tecnico | superadministrador).
+// Body: { hours?: number }  (default 24, capped at 168)
+router.post('/triage/trigger-now', authMiddleware, async (req, res) => {
+    try {
+        const userId = req.user?.id;
+        if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+        const { data: profile, error: profileErr } = await supabaseAdmin
+            .from('profiles')
+            .select('role')
+            .eq('id', userId)
+            .single();
+
+        if (profileErr || !profile || !['tecnico', 'superadministrador'].includes(profile.role)) {
+            return res.status(403).json({ error: 'Forbidden: tecnico or superadministrador role required' });
+        }
+
+        if (!process.env.TRIAGE_RUTINA_URL) {
+            return res.status(503).json({ error: 'rutina not configured on backend' });
+        }
+
+        const rawHours = parseInt(req.body?.hours, 10);
+        const hours = Number.isFinite(rawHours) && rawHours > 0 ? Math.min(rawHours, 168) : 24;
+
+        const digest = await buildErrorDigest({ hours, levels: ['error', 'warning'], limit: 30 });
+        const result = await pushDigestToRutina(digest);
+
+        res.json({
+            ok: !!result.ok,
+            skipped: !!result.skipped,
+            unique_signatures: digest.unique_signatures,
+            totals: digest.totals,
+            window: digest.window,
+        });
+    } catch (err) {
+        console.error('triage/trigger-now failed:', err);
         res.status(500).json({ error: err.message });
     }
 });
