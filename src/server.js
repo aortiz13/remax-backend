@@ -31,6 +31,7 @@ import meetingsRoutes from './routes/meetings.js';
 import meetingBotRoutes from './routes/meetingBot.js';
 import voiceRoutes from './routes/voice.js';
 import voiceCampaignsRoutes from './routes/voiceCampaigns.js';
+import internalRoutes from './routes/internal.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -218,6 +219,7 @@ app.use('/api/meetings', meetingsRoutes);
 app.use('/api/meeting-bot', meetingBotRoutes);
 app.use('/api/voice', voiceRoutes);
 app.use('/api/voice/campaigns', voiceCampaignsRoutes);
+app.use('/api/internal', internalRoutes);
 
 // Legacy Supabase Edge Function path fallback
 // Maps /functions/v1/<name> → /api/<route> for old frontend clients
