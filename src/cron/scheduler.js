@@ -4,6 +4,7 @@ import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import pool from '../lib/db.js';
 import { runCampaignCalls } from '../routes/voiceCampaigns.js';
+import { buildErrorDigest } from '../services/auditDigest.js';
 
 export function startCronJobs() {
     // Calendar sync — every 15 minutes
@@ -853,6 +854,48 @@ export function startCronJobs() {
             }
         } catch (err) {
             logErrorToSlack('error', { category: 'voice-agent', action: 'cron.campaigns', message: err.message });
+        }
+    });
+
+    // Triage rutina push — daily at 8am Chile time (UTC-3 = 11:00 UTC).
+    // Builds the errors digest server-side and pushes it to the claude.ai
+    // rutina API trigger, sidestepping the sandbox egress allowlist that
+    // blocks the rutina from pulling our public host.
+    cron.schedule('0 11 * * *', async () => {
+        console.log('⏰ Cron: Triage rutina push');
+        const url = process.env.TRIAGE_RUTINA_URL;
+        const token = process.env.TRIAGE_RUTINA_TOKEN;
+        if (!url) {
+            console.warn('TRIAGE_RUTINA_URL not configured — skipping push');
+            return;
+        }
+        try {
+            const digest = await buildErrorDigest({ hours: 24, levels: ['error', 'warning'], limit: 30 });
+            if (digest.unique_signatures === 0) {
+                console.log('Triage rutina: 0 signatures in window, skipping push');
+                return;
+            }
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+                },
+                body: JSON.stringify({ digest }),
+            });
+            if (!res.ok) {
+                const body = await res.text().catch(() => '');
+                throw new Error(`rutina trigger HTTP ${res.status}: ${body.slice(0, 200)}`);
+            }
+            console.log(`✅ Triage rutina triggered with ${digest.unique_signatures} signatures`);
+        } catch (err) {
+            console.error('Triage rutina push failed:', err);
+            logErrorToSlack('error', {
+                category: 'cron',
+                action: 'triage_rutina.push',
+                message: err.message,
+                module: 'cron/scheduler',
+            });
         }
     });
 
