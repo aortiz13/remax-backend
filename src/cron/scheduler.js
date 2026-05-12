@@ -4,7 +4,7 @@ import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import pool from '../lib/db.js';
 import { runCampaignCalls } from '../routes/voiceCampaigns.js';
-import { buildErrorDigest } from '../services/auditDigest.js';
+import { buildErrorDigest, pushDigestToRutina } from '../services/auditDigest.js';
 
 export function startCronJobs() {
     // Calendar sync — every 15 minutes
@@ -863,29 +863,16 @@ export function startCronJobs() {
     // blocks the rutina from pulling our public host.
     cron.schedule('0 11 * * *', async () => {
         console.log('⏰ Cron: Triage rutina push');
-        const url = process.env.TRIAGE_RUTINA_URL;
-        const token = process.env.TRIAGE_RUTINA_TOKEN;
-        if (!url) {
-            console.warn('TRIAGE_RUTINA_URL not configured — skipping push');
-            return;
-        }
         try {
             const digest = await buildErrorDigest({ hours: 24, levels: ['error', 'warning'], limit: 30 });
-            if (digest.unique_signatures === 0) {
-                console.log('Triage rutina: 0 signatures in window, skipping push');
+            const result = await pushDigestToRutina(digest);
+            if (result.skipped) {
+                if (result.reason === 'not_configured') {
+                    console.warn('TRIAGE_RUTINA_URL not configured — skipping push');
+                } else {
+                    console.log('Triage rutina: 0 signatures in window, skipping push');
+                }
                 return;
-            }
-            const res = await fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
-                },
-                body: JSON.stringify({ digest }),
-            });
-            if (!res.ok) {
-                const body = await res.text().catch(() => '');
-                throw new Error(`rutina trigger HTTP ${res.status}: ${body.slice(0, 200)}`);
             }
             console.log(`✅ Triage rutina triggered with ${digest.unique_signatures} signatures`);
         } catch (err) {
