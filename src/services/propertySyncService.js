@@ -76,12 +76,19 @@ function buildUpdatePayload(existing, incoming) {
         if (!isEmpty(v) && existing[k] !== v) update[k] = v;
     }
 
-    // Status: only set when empty, or when API reports a closed/paused/withdrawn state
+    // Status: status is treated as a multi-value tag array (e.g. ['Administrada','Arrendada']).
+    //  - Empty in DB                → seed from RE/MAX.
+    //  - DB has tags + API reports a closed/paused/withdrawn state → APPEND the new tag
+    //    rather than replacing, so manual flags like 'Administrada' are preserved when
+    //    a property also gets sold/rented on RE/MAX.
     if (isEmpty(existing.status)) {
         update.status = incoming.status;
     } else if (incoming.is_closed || ['Pausada', 'Retirada'].includes(incoming.status_label)) {
-        const arr = Array.isArray(existing.status) ? existing.status : [existing.status];
-        if (!arr.includes(incoming.status_label)) update.status = incoming.status;
+        const arr = Array.isArray(existing.status) ? [...existing.status] : [existing.status];
+        if (!arr.includes(incoming.status_label)) {
+            arr.push(incoming.status_label);
+            update.status = arr;
+        }
     }
 
     update.source = 'remax';
