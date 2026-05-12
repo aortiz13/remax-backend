@@ -185,7 +185,8 @@ router.post('/send', authMiddleware, async (req, res) => {
 
         // 1. Check Redis is reachable before queueing
         try {
-            await emailQueue.client.ping();
+            const redisClient = await emailQueue.client;
+            await redisClient.ping();
         } catch (redisErr) {
             console.error('[Gmail Send] Redis not reachable:', redisErr.message);
             await logAudit({
