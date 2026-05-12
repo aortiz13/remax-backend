@@ -1,353 +1,391 @@
 /**
- * RE/MAX Listings Service
- * Shared logic for scanning and parsing RE/MAX property listings.
- * Used by both the sync route (POST /api/import/remax-listings) and the cron worker.
+ * RE/MAX Listings Service — projection layer.
+ * Pulls listings from the public RE/MAX Azure Search API and shapes them
+ * into a flat, frontend/DB-friendly form. Also groups multiple listing
+ * versions of the same physical property (by ListingReference / ROL).
+ *
+ * Used by:
+ *   - routes/sync.js              (manual admin sync from /admin/import)
+ *   - services/propertySyncService.js (cron worker + manual sync)
  */
 
-// Helper: case-insensitive key lookup
+const SEARCH_URL = 'https://www.remax.cl/search/listing-search/docs/search';
+const PAGE_SIZE = 200;
+const MAX_LISTINGS_PER_AGENT = 2000;
+
+// ListingStatusUID → label / activity flags (verified against facet data on 13k+ CL listings)
+export const STATUS_MAP = {
+    160: { label: 'Activa',     active: true,  closed: false },
+    161: { label: 'Retirada',   active: false, closed: false }, // Expirada sin relistar
+    162: { label: 'Retirada',   active: false, closed: false },
+    164: { label: 'Retirada',   active: false, closed: false },
+    166: { label: 'Retirada',   active: false, closed: false },
+    167: { label: 'Vendida',    active: false, closed: true  },
+    168: { label: 'Pausada',    active: false, closed: false },
+    169: { label: 'Concretada', active: false, closed: true  }, // Cerrada (arriendo/promesa)
+    4812: { label: 'Retirada',  active: false, closed: false },
+};
+
+export const TRANSACTION_TYPE_MAP = {
+    260: 'venta',
+    261: 'arriendo',
+};
+
+export const PROPERTY_TYPE_MAP = {
+    194: 'Departamento', 202: 'Casa', 196: 'Casa',
+    13:  'Comercial',    211: 'Oficina', 18: 'Terreno', 19: 'Terreno',
+    197: 'Parcela',      220: 'Bodega',  224: 'Estacionamiento', 230: 'Industrial',
+    3202: 'Departamento', 3211: 'Oficina', 3212: 'Comercial', 3199: 'Comercial',
+    3320: 'Casa', 3321: 'Departamento', 3323: 'Comercial', 3499: 'Terreno',
+    2901: 'Parcela', 2806: 'Casa', 2785: 'Terreno', 2778: 'Terreno',
+    1003: 'Industrial', 1009: 'Industrial', 1114: 'Bodega', 1116: 'Estacionamiento',
+    799: 'Comercial', 5292: 'Comercial', 5553: 'Industrial',
+};
+
+export const URL_TYPE_MAP = {
+    oficina: 'Oficina', departamento: 'Departamento', casa: 'Casa',
+    terreno: 'Terreno', comercial: 'Comercial', bodega: 'Bodega',
+    estacionamiento: 'Estacionamiento', parcela: 'Parcela',
+    industrial: 'Industrial', sitio: 'Terreno', agricola: 'Parcela',
+};
+
+// Helpers
 const getVal = (obj, key) => {
     if (!obj) return undefined;
     const foundKey = Object.keys(obj).find(k => k.toLowerCase() === key.toLowerCase());
     return foundKey ? obj[foundKey] : undefined;
 };
 
-// Helper: parse date from RE/MAX API (handles ISO strings, Unix timestamps, and epoch ms)
-const parseDate = (val) => {
-    if (!val) return null;
-    if (typeof val === 'string') {
-        // Already ISO string
-        if (val.includes('T') || val.includes('-')) return val;
-        // Numeric string
-        val = Number(val);
-    }
-    if (typeof val === 'number') {
-        // Unix timestamp in seconds (< 10 billion) vs milliseconds
-        const ms = val < 1e11 ? val * 1000 : val;
-        try {
-            return new Date(ms).toISOString();
-        } catch {
-            return null;
-        }
-    }
-    return null;
+const tsToMs = (v) => {
+    if (!v) return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    return n < 1e11 ? n * 1000 : n;
 };
 
-/**
- * Search RE/MAX listings API
- * @param {string} filter - OData filter string
- * @param {number} top - Max results
- * @returns {Promise<Array>} raw listing objects from RE/MAX API
- */
-export async function searchRemaxListings(filter, top = 200) {
-    const searchUrl = 'https://www.remax.cl/search/listing-search/docs/search';
-    const payload = {
-        count: true,
-        skip: 0,
-        top,
-        search: '*',
-        filter,
-    };
+const tsToIso = (v) => {
+    const ms = tsToMs(v);
+    if (ms === null) return null;
+    try { return new Date(ms).toISOString(); } catch { return null; }
+};
 
-    const response = await fetch(searchUrl, {
-        method: 'POST',
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Content-Type': 'application/json',
-            'Origin': 'https://www.remax.cl',
-            'Referer': 'https://www.remax.cl/',
-        },
-        body: JSON.stringify(payload),
-    });
+const toNum = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+};
 
-    if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`RE/MAX API Error: ${response.status} - ${text.substring(0, 200)}`);
+const pickDescription = (descArr, typeUID) => {
+    if (!Array.isArray(descArr) || !descArr.length) return '';
+    let candidates = descArr.filter(d => d?.ISOLanguageCode === 'es' || d?.LanguageCode?.startsWith?.('es'));
+    if (!candidates.length) candidates = descArr;
+    if (typeUID) {
+        const m = candidates.find(d => String(d.DescriptionTypeUID) === typeUID);
+        if (m?.Description) return m.Description;
     }
+    return candidates[0]?.Description || '';
+};
 
-    const result = await response.json();
-    return result.value || [];
+const buildImageUrl = (fileName, countryId) =>
+    `https://remax.azureedge.net/userimages/${countryId || 1028}/LargeWM/${fileName}`;
+
+const detectPropertyType = (sourceUrl, propertyTypeUID, title, desc) => {
+    if (sourceUrl) {
+        const parts = sourceUrl.toLowerCase().split('/');
+        const idx = parts.indexOf('propiedades');
+        if (idx !== -1 && parts.length > idx + 1) {
+            const seg = parts[idx + 1];
+            if (URL_TYPE_MAP[seg]) return URL_TYPE_MAP[seg];
+        }
+    }
+    if (propertyTypeUID && PROPERTY_TYPE_MAP[propertyTypeUID]) return PROPERTY_TYPE_MAP[propertyTypeUID];
+    const combined = `${title} ${desc}`.toUpperCase();
+    if (combined.includes('OFICINA')) return 'Oficina';
+    if (combined.includes('LOCAL COMERCIAL') || combined.includes('COMERCIAL')) return 'Comercial';
+    if (combined.includes('TERRENO') || combined.includes('SITIO')) return 'Terreno';
+    if (combined.includes('PARCELA')) return 'Parcela';
+    if (combined.includes('BODEGA')) return 'Bodega';
+    if (combined.includes('ESTACIONAMIENTO')) return 'Estacionamiento';
+    if (combined.includes('CASA')) return 'Casa';
+    return 'Departamento';
+};
+
+const detectOperationType = (sourceUrl, transactionTypeUID) => {
+    if (sourceUrl) {
+        const parts = sourceUrl.toLowerCase().split('/');
+        const idx = parts.indexOf('propiedades');
+        if (idx !== -1 && parts.length > idx + 2) {
+            const op = parts[idx + 2];
+            if (op === 'venta') return 'venta';
+            if (op === 'arriendo' || op === 'rent') return 'arriendo';
+        }
+    }
+    return TRANSACTION_TYPE_MAP[transactionTypeUID] || 'venta';
+};
+
+const buildSourceUrl = (shortLinks, mlsId) => {
+    if (Array.isArray(shortLinks) && shortLinks.length) {
+        const es = shortLinks.find(l => l.ISOLanguageCode === 'es' || l.LanguageCode === 'es-CL');
+        const pick = es || shortLinks[0];
+        if (pick?.ShortLink) return { url: `https://www.remax.cl/${pick.ShortLink}`, shortLink: pick.ShortLink };
+    }
+    return { url: mlsId ? `https://www.remax.cl/es-cl/propiedades/${mlsId}` : 'https://www.remax.cl/', shortLink: '' };
+};
+
+/** Paginated fetcher — pulls every listing for an agent (active + history). */
+export async function fetchAllListings(agentId) {
+    const out = [];
+    let skip = 0;
+    let total = Infinity;
+
+    while (skip < total && out.length < MAX_LISTINGS_PER_AGENT) {
+        const payload = {
+            count: true, skip, top: PAGE_SIZE, search: '*',
+            filter: `content/AgentId eq ${agentId}`,
+        };
+
+        const res = await fetch(SEARCH_URL, {
+            method: 'POST',
+            headers: {
+                'User-Agent': 'Mozilla/5.0',
+                'Content-Type': 'application/json',
+                'Origin': 'https://www.remax.cl',
+                'Referer': `https://www.remax.cl/listings?AgentID=${agentId}`,
+            },
+            body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`RE/MAX API ${res.status}: ${text.slice(0, 200)}`);
+        }
+        const data = await res.json();
+        const page = data.value || [];
+        if (skip === 0 && typeof data['@odata.count'] === 'number') total = data['@odata.count'];
+        out.push(...page);
+        if (page.length < PAGE_SIZE) break;
+        skip += PAGE_SIZE;
+    }
+    return out;
 }
 
-/**
- * Parse a single RE/MAX listing into our property format
- */
-export function parseListing(item, agentId) {
-    const p = item.content || item;
+/** Project one raw Azure-Search document into our flat representation. */
+export function projectListing(raw, agentId) {
+    const p = raw.content || raw;
 
-    // ID & URL
-    let listingId = getVal(p, 'ListingId') || getVal(p, 'MLSID');
-    let sourceUrl = '';
-    const shortLinks = getVal(p, 'ShortLinks');
-    if (Array.isArray(shortLinks) && shortLinks.length > 0) {
-        const link = shortLinks.find(l => l.ISOLanguageCode === 'es' || l.LanguageCode === 'es-CL') || shortLinks[0];
-        if (link && link.ShortLink) {
-            sourceUrl = `https://www.remax.cl/${link.ShortLink}`;
-            if (!listingId) listingId = link.ShortLink.split('/').pop();
-        }
-    }
-    if (!sourceUrl && listingId) sourceUrl = `https://www.remax.cl/propiedades/${listingId}`;
+    const listingId = getVal(p, 'ListingId');
+    const mlsId = getVal(p, 'MLSID');
+    const listingReference = getVal(p, 'ListingReference');
+    const listingKey = getVal(p, 'ListingKey');
 
-    // Listing reference (physical property identifier)
-    const listingReference = getVal(p, 'ListingReference') || getVal(p, 'MLSNumber') || '';
+    const countryId = getVal(p, 'CountryID') || 1028;
+    const { url: sourceUrl, shortLink } = buildSourceUrl(getVal(p, 'ShortLinks'), mlsId);
 
-    // Basic Info
-    const title = getVal(p, 'FullAddress') || getVal(p, 'ListingName') || 'Propiedad sin título';
-    const address = getVal(p, 'FullAddress') || title;
+    const geoEs = (getVal(p, 'GeoDatas') || []).find(g =>
+        g?.LanguageCode === 'es-CL' || g?.LanguageCode?.startsWith?.('es')
+    ) || {};
+    const city = getVal(p, 'City') || geoEs.City || '';
+    const province = getVal(p, 'Province') || geoEs.Province || '';
+    const regionalZone = getVal(p, 'RegionalZone') || geoEs.RegionalZone || '';
+    const localZone = getVal(p, 'LocalZone') || geoEs.LocalZone || '';
+    const fullAddress = getVal(p, 'FullAddress') || geoEs.FullAddress || '';
+    const titleAddress = getVal(p, 'TitleAddress') || geoEs.TitleAddress || '';
+    const commune = city || localZone || province || '';
 
-    // Extract commune
-    const addressParts = getVal(p, 'AddressParts');
-    let commune = '';
-    if (addressParts) {
-        commune = getVal(addressParts, 'City') || getVal(addressParts, 'Commune') || getVal(addressParts, 'StateOrProvince') || '';
-    }
-    if (!commune && address.includes(',')) {
-        const parts = address.split(',').map(s => s.trim());
-        commune = parts[1] || '';
-    }
-
-    const m2_total = getVal(p, 'TotalArea') || 0;
-    const m2_built = getVal(p, 'LivingArea') || getVal(p, 'BuiltArea') || 0;
-    const bedrooms = getVal(p, 'NumberOfBedrooms') || 0;
-    const bathrooms = getVal(p, 'NumberOfBathrooms') || 0;
-    const parkingSpaces = getVal(p, 'NumberOfParkingSpaces') || getVal(p, 'ParkingSpaces') || 0;
-    const floorNumber = getVal(p, 'FloorNumber') || getVal(p, 'Floor') || null;
-    const yearBuilt = getVal(p, 'YearBuilt') || null;
-    const maintenanceFee = getVal(p, 'MaintenanceFee') || getVal(p, 'CommonExpenses') || null;
-
-    // Description
-    let desc = '';
-    const descArray = getVal(p, 'ListingDescriptions');
-    if (Array.isArray(descArray) && descArray.length > 0) {
-        desc = descArray.find(d => d.ISOLanguageCode === 'es')?.Description || descArray[0].Description || '';
-    }
-
-    // Location
-    let latitude = null;
-    let longitude = null;
+    let latitude = null, longitude = null;
     const loc = getVal(p, 'Location');
-    if (loc && loc.coordinates) {
-        longitude = loc.coordinates[0];
-        latitude = loc.coordinates[1];
-    }
+    if (loc?.coordinates) { longitude = loc.coordinates[0]; latitude = loc.coordinates[1]; }
 
-    // Status & viewability
-    const isViewable = getVal(p, 'IsViewable') ?? true;
-    const listingStatusUid = getVal(p, 'ListingStatusUID') || getVal(p, 'ListingStatusUid') || null;
-    const transactionTypeUid = getVal(p, 'TransactionTypeUID') || getVal(p, 'TransactionTypeUid') || null;
-    const isExclusive = getVal(p, 'IsExclusive') || false;
+    const descArr = getVal(p, 'ListingDescriptions') || [];
+    const description = pickDescription(descArr, '629') || pickDescription(descArr);
+    const descriptionShort = pickDescription(descArr, '1113');
+    const descriptionSector = pickDescription(descArr, '3139');
+    const descriptionUnit = pickDescription(descArr, '5685');
 
-    // Dates
-    const publishedAt = parseDate(getVal(p, 'ListingDate') || getVal(p, 'PublishedDate'));
-    const expiresAt = parseDate(getVal(p, 'ExpirationDate'));
-    const lastUpdatedAt = parseDate(getVal(p, 'ModifiedDate') || getVal(p, 'LastModifiedDate'));
-    const soldAt = parseDate(getVal(p, 'SoldDate') || getVal(p, 'ClosedDate'));
-    const soldPrice = getVal(p, 'SoldPrice') || getVal(p, 'ClosedPrice') || null;
+    const listingStatusUID = Number(getVal(p, 'ListingStatusUID')) || 0;
+    const transactionTypeUID = Number(getVal(p, 'TransactionTypeUID')) || 0;
+    const propertyTypeUID = Number(getVal(p, 'PropertyTypeUID')) || 0;
+    const marketStatusUID = Number(getVal(p, 'MarketStatusUID')) || 0;
 
-    // Virtual tour & video
-    const virtualTourUrl = getVal(p, 'VirtualTourURL') || getVal(p, 'VirtualTourUrl') || null;
-    const videoUrl = getVal(p, 'VideoURL') || getVal(p, 'VideoUrl') || null;
+    const operationType = detectOperationType(sourceUrl, transactionTypeUID);
+    const propertyType = detectPropertyType(sourceUrl, propertyTypeUID, fullAddress, description);
 
-    // --- TYPE CLASSIFICATION ---
-    let propertyType = 'Departamento';
-    let operationType = 'venta';
-    let statusArr = ['Publicada', 'En Venta'];
+    const statusEntry = STATUS_MAP[listingStatusUID] || { label: 'Desconocido', active: false, closed: false };
+    let statusLabel = statusEntry.label;
+    if (listingStatusUID === 167 && operationType === 'arriendo') statusLabel = 'Arrendada';
 
-    const pTypeUID = getVal(p, 'PropertyTypeUID');
-    const propTypeVal = getVal(p, 'PropertyType');
-    const propTypeName = typeof propTypeVal === 'string' ? propTypeVal : (getVal(propTypeVal, 'PropertyTypeName') || '');
+    const rawImages = getVal(p, 'ListingImages') || [];
+    const sortedImages = [...rawImages].sort(
+        (a, b) => (parseInt(a?.Order, 10) || 0) - (parseInt(b?.Order, 10) || 0)
+    );
+    const imageUrls = sortedImages
+        .filter(img => img?.FileName)
+        .map((img, idx) => ({
+            url: buildImageUrl(img.FileName, countryId),
+            caption: img.Name || `Foto ${idx + 1}`,
+            position: idx,
+            quality: img.ImageQualityTypeUID || null,
+            is_watermarked: img.IsWatermarked === '1' || img.IsWatermarked === 1,
+        }));
+    const primaryImage = imageUrls[0]?.url || null;
 
-    const titleUpper = title.toUpperCase();
-    const descUpper = desc.toUpperCase();
-    const typeNameUpper = propTypeName.toUpperCase();
-
-    // 1. Property Type UID mapping
-    if (pTypeUID === 194) propertyType = 'Departamento';
-    else if (pTypeUID === 202) propertyType = 'Casa';
-    else if (pTypeUID === 13) propertyType = 'Comercial';
-    else if (pTypeUID === 19) propertyType = 'Terreno';
-
-    // 2. Transaction Type UID mapping (PRIMARY)
-    // 260 = Arriendo, 261 = Venta
-    if (transactionTypeUid === 260) {
-        operationType = 'arriendo';
-        statusArr = ['Publicada'];
-    } else if (transactionTypeUid === 261) {
-        operationType = 'venta';
-        statusArr = ['Publicada', 'En Venta'];
-    }
-
-    // 3. Parse from URL (FALLBACK/REFINEMENT)
-    if (sourceUrl) {
-        const urlLower = sourceUrl.toLowerCase();
-        const urlParts = urlLower.split('/');
-        const propIndex = urlParts.indexOf('propiedades');
-
-        if (propIndex !== -1 && urlParts.length > propIndex + 2) {
-            const urlType = urlParts[propIndex + 1];
-            const urlOp = urlParts[propIndex + 2];
-
-            const typeMap = {
-                'oficina': 'Oficina', 'departamento': 'Departamento', 'casa': 'Casa',
-                'terreno': 'Terreno', 'comercial': 'Comercial', 'bodega': 'Bodega',
-                'estacionamiento': 'Estacionamiento',
-            };
-            if (typeMap[urlType]) propertyType = typeMap[urlType];
-
-            // Only override UID if we found a clear keyword in the URL
-            if (urlOp === 'venta') {
-                operationType = 'venta';
-                statusArr = ['Publicada', 'En Venta'];
-            } else if (urlOp === 'arriendo' || urlOp === 'rent') {
-                operationType = 'arriendo';
-                statusArr = ['Publicada'];
-            }
-        }
-    }
-
-    // 3. Keyword fallback
-    if (propertyType === 'Departamento' && !sourceUrl?.toLowerCase().includes('departamento')) {
-        const combined = `${titleUpper} ${descUpper} ${typeNameUpper}`;
-        if (combined.includes('OFICINA')) propertyType = 'Oficina';
-        else if (combined.includes('LOCAL') || combined.includes('COMERCIAL')) propertyType = 'Comercial';
-        else if (combined.includes('TERRENO')) propertyType = 'Terreno';
-        else if (combined.includes('CASA')) propertyType = 'Casa';
-    }
-
-    // Listing status label
-    let statusLabel = 'Activa';
-    if (!isViewable) {
-        if (listingStatusUid === 167) statusLabel = 'Concretada';
-        else if (listingStatusUid === 165 || listingStatusUid === 169) statusLabel = 'Retirada';
-        else statusLabel = 'Inactiva';
-    }
-    if (soldAt) statusLabel = soldPrice ? 'Vendida' : 'Concretada';
-
-    if (statusLabel === 'Vendida') statusArr = ['Vendida'];
-    else if (statusLabel === 'Concretada') statusArr = ['Concretada'];
-    else if (statusLabel === 'Retirada') statusArr = ['Retirada'];
-    else if (statusLabel === 'Inactiva') statusArr = ['Pausada'];
-
-    // Images
-    let imageUrl = null;
-    const imageUrls = [];
-    const images = getVal(p, 'ListingImages');
-    if (Array.isArray(images) && images.length > 0) {
-        const sorted = [...images].sort((a, b) => (parseInt(a.Order) || 0) - (parseInt(b.Order) || 0));
-        const countryId = getVal(p, 'CountryID') || 1028;
-
-        sorted.forEach((img, idx) => {
-            if (img && img.FileName) {
-                const url = `https://remax.azureedge.net/userimages/${countryId}/LargeWM/${img.FileName}`;
-                if (idx === 0) imageUrl = url;
-                imageUrls.push({ url, caption: img.Caption || `Foto ${idx + 1}`, position: idx });
-            }
-        });
-    }
+    const features = (getVal(p, 'ListingFeatures') || []).map(f => ({
+        group: f.GroupingName, name: f.FeatureName, id: f.FeatureID,
+    }));
+    const rooms = (getVal(p, 'ListingRooms') || []).map(r => ({
+        type_uid: r.RoomTypeUID, size: r.RoomSize, dimensions: r.Dimensions,
+        description: r.ShortDescription,
+        image: r.ImageFileName ? buildImageUrl(r.ImageFileName, countryId) : null,
+    }));
 
     return {
-        source_url: sourceUrl || 'https://www.remax.cl/',
-        title: title || 'Propiedad sin título',
+        listing_id: listingId,
+        mls_id: mlsId,
+        listing_reference: listingReference,
+        listing_key: listingKey,
+        source_url: sourceUrl,
+        short_link: shortLink,
+
+        title: (descriptionShort && descriptionShort.length < 120 ? descriptionShort : null)
+            || fullAddress || titleAddress || 'Propiedad sin título',
+        address: fullAddress,
+        commune, city, province,
+        region: regionalZone,
+        local_zone: localZone,
+        postal_code: getVal(p, 'PostalCode') || null,
+        street_name: getVal(p, 'StreetName') || null,
+        street_number: getVal(p, 'StreetNumber') || null,
+        apartment_number: getVal(p, 'ApartmentNumber') || null,
+
         property_type: propertyType,
         operation_type: operationType,
-        address, commune,
-        m2_total: Math.round(m2_total),
-        m2_built: Math.round(m2_built),
-        bedrooms, bathrooms,
-        description: desc,
-        latitude, longitude,
-        agent_id: agentId,
-        status: statusArr,
+        property_type_uid: propertyTypeUID,
+        transaction_type_uid: transactionTypeUID,
+
+        listing_status_uid: listingStatusUID,
+        market_status_uid: marketStatusUID,
         status_label: statusLabel,
-        price: getVal(p, 'ListingPrice') || 0,
+        status: [statusLabel],
+        is_active: statusEntry.active,
+        is_closed: statusEntry.closed,
+        is_viewable: getVal(p, 'IsViewable') === true,
+        on_hold: getVal(p, 'OnHoldListing') === true,
+        is_exclusive: getVal(p, 'ShowContractTypeExclusive') === true,
+        hide_price_public: getVal(p, 'HidePricePublic') === true,
+        show_address_public: getVal(p, 'ShowAddressPublic') === true,
+
+        m2_total: Math.round(getVal(p, 'TotalArea') || 0),
+        m2_built: Math.round(getVal(p, 'LivingArea') || getVal(p, 'BuiltArea') || 0),
+        lot_size: toNum(getVal(p, 'LotSize')) ?? toNum(getVal(p, 'LotSize2')),
+        bedrooms: getVal(p, 'NumberOfBedrooms') || 0,
+        bathrooms: getVal(p, 'NumberOfBathrooms') || 0,
+        toilet_rooms: getVal(p, 'NumberOfToiletRooms') || 0,
+        total_rooms: getVal(p, 'TotalNumOfRooms') || 0,
+        parking_spaces: getVal(p, 'ParkingSpaces') || getVal(p, 'NumberOfGarages') || 0,
+        storage_rooms: getVal(p, 'NumberOfStorageRooms') || 0,
+        floor_number: getVal(p, 'FloorLevelNumber') || getVal(p, 'FloorNumber') || null,
+        total_floors: getVal(p, 'NumberOfFloors') || null,
+        year_built: getVal(p, 'YearBuilt') ? Number(getVal(p, 'YearBuilt')) || null : null,
+
+        price: toNum(getVal(p, 'ListingPrice')) ?? 0,
         currency: getVal(p, 'ListingCurrency') || 'CLP',
-        image_url: imageUrl,
+        price_eur: toNum(getVal(p, 'ListingPriceEuro')),
+        maintenance_fee: toNum(getVal(p, 'MaintenanceFee')),
+        condo_fees: toNum(getVal(p, 'CondoFees')),
+        property_tax: toNum(getVal(p, 'PropertyTax')),
+        sold_price: toNum(getVal(p, 'SoldPrice')),
+
+        published_at: tsToIso(getVal(p, 'OrigListingDate')) || tsToIso(getVal(p, 'FirstUpdatedToWeb')),
+        first_published_at: tsToIso(getVal(p, 'FirstUpdatedToWeb')) || tsToIso(getVal(p, 'OrigListingDate')),
+        last_updated_at: tsToIso(getVal(p, 'LastUpdatedOnWeb')),
+        expires_at: tsToIso(getVal(p, 'ExpiryDate')),
+        sold_at: tsToIso(getVal(p, 'SoldDate')) || tsToIso(getVal(p, 'SoldStatusDate')),
+        availability_date: getVal(p, 'AvailabilityDate') || null,
+
+        latitude, longitude,
+
+        image_url: primaryImage,
         image_urls: imageUrls,
-        listing_id: listingId,
-        listing_reference: listingReference,
-        listing_status_uid: listingStatusUid,
-        transaction_type_uid: transactionTypeUid,
-        is_viewable: isViewable,
-        is_exclusive: isExclusive,
-        published_at: publishedAt,
-        expires_at: expiresAt,
-        last_updated_at: lastUpdatedAt,
-        sold_at: soldAt,
-        sold_price: soldPrice,
-        year_built: yearBuilt,
-        maintenance_fee: maintenanceFee,
-        virtual_tour_url: virtualTourUrl,
-        video_url: videoUrl,
-        parking_spaces: parkingSpaces,
-        floor_number: floorNumber,
+        video_url: getVal(p, 'VideoLinkURL') || null,
+        virtual_tour_url: getVal(p, 'VirtualTourURL') || getVal(p, 'VirtualRealityTourURL') || null,
+        floor_plan_url: getVal(p, 'FloorPlanURL') || null,
+        pdf_brochure_url: getVal(p, 'PdfBrochureURL') || null,
+        qr_code_url: getVal(p, 'QRCodeUrl') || null,
+        has_enhanced_multimedia: getVal(p, 'HasEnhancedMultimedia') === true,
+        has_street_view: getVal(p, 'HasStreetView') === true,
+        has_public_document: getVal(p, 'HasPublicDocument') === true,
+
+        description,
+        description_short: descriptionShort,
+        description_sector: descriptionSector,
+        description_unit: descriptionUnit,
+        features, rooms,
+
+        agent_id: agentId,
+        office_id: getVal(p, 'OfficeId') || null,
+        team_id: getVal(p, 'TeamID') || null,
+        representing_agent_id: getVal(p, 'RepresentingAgentID') || null,
     };
 }
 
-/**
- * Group listings by ListingReference (physical property).
- * A single physical property can have multiple listing versions over time.
- */
-export function groupByPhysicalProperty(listings) {
-    const groups = {};
-
-    for (const listing of listings) {
-        const ref = listing.listing_reference || listing.listing_id || listing.source_url;
-        if (!groups[ref]) groups[ref] = [];
-        groups[ref].push(listing);
+/** Group multiple listing versions (same ROL) into one physical property + history[]. */
+export function groupByReference(projected) {
+    const groups = new Map();
+    for (const item of projected) {
+        const key = (item.listing_reference || item.mls_id || `__no_ref_${item.listing_id}`).trim();
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(item);
     }
 
-    return Object.values(groups).map(group => {
-        group.sort((a, b) => {
-            const dateA = a.published_at ? new Date(a.published_at).getTime() : 0;
-            const dateB = b.published_at ? new Date(b.published_at).getTime() : 0;
-            return dateB - dateA;
-        });
+    const sortByRecency = (a, b) =>
+        (new Date(b.last_updated_at || b.published_at || 0).getTime()) -
+        (new Date(a.last_updated_at || a.published_at || 0).getTime());
 
-        const current = group[0];
-        const history = group.map(l => ({
-            listing_id: l.listing_id,
-            published_at: l.published_at,
-            expires_at: l.expires_at,
-            price: l.price,
-            currency: l.currency,
-            listing_status_uid: l.listing_status_uid,
-            status_label: l.status_label,
+    const out = [];
+    for (const [, items] of groups) {
+        items.sort(sortByRecency);
+        const current = items[0];
+        const activeIdx = items.findIndex(i => i.is_viewable && !i.on_hold);
+        const head = activeIdx > 0 ? items[activeIdx] : current;
+
+        const history = items.filter(i => i !== head).map(i => ({
+            listing_id: i.listing_id,
+            mls_id: i.mls_id,
+            published_at: i.published_at,
+            expires_at: i.expires_at,
+            sold_at: i.sold_at,
+            price: i.price,
+            currency: i.currency,
+            sold_price: i.sold_price,
+            listing_status_uid: i.listing_status_uid,
+            status_label: i.status_label,
+            operation_type: i.operation_type,
         }));
 
-        const firstPublished = group[group.length - 1]?.published_at || current.published_at;
+        const firstPublished = items
+            .map(i => i.first_published_at || i.published_at)
+            .filter(Boolean)
+            .sort()[0] || head.first_published_at;
 
-        return {
-            ...current,
-            history,
-            total_versions: group.length,
+        out.push({
+            ...head,
             first_published_at: firstPublished,
-        };
+            total_versions: items.length,
+            history,
+        });
+    }
+    out.sort((a, b) => {
+        if (a.is_active !== b.is_active) return a.is_active ? -1 : 1;
+        return (new Date(b.last_updated_at || b.published_at || 0).getTime()) -
+               (new Date(a.last_updated_at || a.published_at || 0).getTime());
     });
+    return out;
 }
 
-/**
- * Scan all listings for an agent (active + history).
- * Returns { properties, totalListings }
- */
+/** One-shot: fetch + project + group for an agent. */
 export async function scanAgentListings(remaxAgentId) {
-    // 1. Active listings
-    const activeFilter = `content/AgentId eq ${remaxAgentId} and content/IsViewable eq true and content/OnHoldListing eq false`;
-    const activeListings = await searchRemaxListings(activeFilter);
-
-    // 2. All listings (for history)
-    let allListings = [];
-    try {
-        const allFilter = `content/AgentId eq ${remaxAgentId}`;
-        allListings = await searchRemaxListings(allFilter, 500);
-    } catch {
-        allListings = activeListings;
-    }
-
-    // 3. Parse & group
-    const parsedAll = allListings.map(item => parseListing(item, remaxAgentId));
-    const physicalProperties = groupByPhysicalProperty(parsedAll);
-
-    return {
-        properties: physicalProperties,
-        totalListings: allListings.length,
-    };
+    const raw = await fetchAllListings(String(remaxAgentId));
+    const projected = raw.map(r => projectListing(r, String(remaxAgentId)));
+    const properties = groupByReference(projected);
+    return { properties, totalListings: raw.length };
 }
