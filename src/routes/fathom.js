@@ -369,4 +369,30 @@ router.get('/recordings/stats', async (req, res) => {
     }
 });
 
+// ─── GET /api/fathom/recordings/:id — Full detail for modal (transcript+more)
+router.get('/recordings/:id', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT
+                m.id, m.candidate_id, m.fathom_recording_id, m.fathom_share_url, m.fathom_meeting_url,
+                m.recording_url, m.recording_duration_seconds, m.recording_format,
+                m.transcript_text, m.transcript_json,
+                m.summary, m.action_items, m.invitee_emails,
+                m.meeting_type, m.meeting_platform, m.meeting_source,
+                m.form_applied, m.form_applied_at, m.extracted_form,
+                m.started_at, m.ended_at, m.created_at, m.updated_at,
+                c.first_name, c.last_name, c.email, c.phone, c.pipeline_stage
+             FROM recruitment_meetings m
+             JOIN recruitment_candidates c ON c.id = m.candidate_id
+             WHERE m.id = $1`,
+            [req.params.id]
+        );
+        if (!rows[0]) return res.status(404).json({ error: 'Recording not found' });
+        res.json(rows[0]);
+    } catch (err) {
+        console.error('[Fathom] Recording detail error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 export default router;
