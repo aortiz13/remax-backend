@@ -1,19 +1,24 @@
 /**
- * Anthropic translator for Fathom meeting summaries.
+ * Multi-provider translator for Fathom meeting summaries.
  *
  * Fathom returns the summary in English even when the meeting is in Spanish
  * (its template language is account-wide, not per-recording). We translate
  * to Spanish on ingest preserving the markdown structure exactly — headings
  * (`###`), bullet lists, and the timestamp links to fathom.video/share/...
  *
- * Uses Anthropic's Claude API. Returns { text, status } so callers know if
- * the translation actually happened or if we fell back to the original.
+ * Provider routing is auto-detected from the API key prefix:
+ *   - sk-ant-...   → Anthropic Claude (/v1/messages)
+ *   - sk-...       → OpenAI GPT       (/v1/chat/completions)
+ * Both env vars are read; if both exist, ANTHROPIC_API_KEY wins.
  */
 
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.FATHOM_TRANSLATE_MODEL || 'claude-haiku-4-5-20251001';
+const OPENAI_API_KEY    = process.env.OPENAI_API_KEY;
+const FORCE_PROVIDER    = process.env.FATHOM_TRANSLATE_PROVIDER; // 'anthropic' | 'openai'
+const ANTHROPIC_MODEL   = process.env.FATHOM_TRANSLATE_MODEL_ANTHROPIC || 'claude-haiku-4-5-20251001';
+const OPENAI_MODEL      = process.env.FATHOM_TRANSLATE_MODEL_OPENAI    || 'gpt-4o-mini';
 
 const TRANSLATE_PROMPT = `Eres un traductor profesional. Recibirás un resumen de reunión en formato Markdown.
 
@@ -27,71 +32,117 @@ Tu tarea:
 Devuelve SOLO el markdown traducido, sin explicaciones adicionales, sin comillas de código, sin "Aquí está la traducción:".`;
 
 /**
+ * Decide which provider+key to use based on env vars and key prefixes.
+ * @returns {{ provider: 'anthropic'|'openai'|null, key: string|null, reason: string }}
+ */
+function pickProvider() {
+    // Explicit override wins.
+    if (FORCE_PROVIDER === 'anthropic' && ANTHROPIC_API_KEY) {
+        return { provider: 'anthropic', key: ANTHROPIC_API_KEY, reason: 'forced anthropic' };
+    }
+    if (FORCE_PROVIDER === 'openai' && OPENAI_API_KEY) {
+        return { provider: 'openai', key: OPENAI_API_KEY, reason: 'forced openai' };
+    }
+
+    // Auto-detect by key prefix. ANTHROPIC_API_KEY wins if it's actually a Claude key.
+    if (ANTHROPIC_API_KEY?.startsWith('sk-ant-')) {
+        return { provider: 'anthropic', key: ANTHROPIC_API_KEY, reason: 'sk-ant- in ANTHROPIC_API_KEY' };
+    }
+    if (OPENAI_API_KEY?.startsWith('sk-') && !OPENAI_API_KEY.startsWith('sk-ant-')) {
+        return { provider: 'openai', key: OPENAI_API_KEY, reason: 'sk- in OPENAI_API_KEY' };
+    }
+    // Fallback: if ANTHROPIC_API_KEY contains an OpenAI-style key (sk-... not sk-ant-),
+    // route it to OpenAI. This is the exact misconfiguration the user reported.
+    if (ANTHROPIC_API_KEY?.startsWith('sk-') && !ANTHROPIC_API_KEY.startsWith('sk-ant-')) {
+        return { provider: 'openai', key: ANTHROPIC_API_KEY, reason: 'sk- (non-ant) in ANTHROPIC_API_KEY → routing to OpenAI' };
+    }
+    return { provider: null, key: null, reason: 'no usable key found' };
+}
+
+async function callAnthropic(key, markdown) {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'x-api-key': key,
+            'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+            model: ANTHROPIC_MODEL,
+            max_tokens: 4096,
+            system: TRANSLATE_PROMPT,
+            messages: [{ role: 'user', content: markdown }],
+        }),
+    });
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`Anthropic ${res.status}: ${errText.substring(0, 300)}`);
+    }
+    const data = await res.json();
+    return data.content?.[0]?.text?.trim() || null;
+}
+
+async function callOpenAI(key, markdown) {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'content-type': 'application/json',
+            'authorization': `Bearer ${key}`,
+        },
+        body: JSON.stringify({
+            model: OPENAI_MODEL,
+            temperature: 0.2,
+            messages: [
+                { role: 'system', content: TRANSLATE_PROMPT },
+                { role: 'user',   content: markdown },
+            ],
+        }),
+    });
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`OpenAI ${res.status}: ${errText.substring(0, 300)}`);
+    }
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content?.trim() || null;
+}
+
+/**
  * Translate a Fathom-formatted markdown summary to Spanish.
  * @param {string} markdown
- * @returns {Promise<{ text: string, status: 'translated'|'no_key'|'empty'|'failed', error?: string }>}
+ * @returns {Promise<{ text: string, status: 'translated'|'no_key'|'empty'|'failed', provider?: string, error?: string }>}
  */
 export async function translateSummaryToSpanish(markdown) {
     if (!markdown || typeof markdown !== 'string' || !markdown.trim()) {
         return { text: markdown, status: 'empty' };
     }
-    if (!ANTHROPIC_API_KEY) {
-        console.warn('[Fathom] ANTHROPIC_API_KEY not set, skipping summary translation');
+    const { provider, key, reason } = pickProvider();
+    if (!provider) {
+        console.warn('[Fathom] No translation API key configured:', reason);
         return { text: markdown, status: 'no_key' };
     }
 
     try {
-        const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'x-api-key': ANTHROPIC_API_KEY,
-                'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify({
-                model: MODEL,
-                max_tokens: 4096,
-                system: TRANSLATE_PROMPT,
-                messages: [{ role: 'user', content: markdown }],
-            }),
-        });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            const snippet = errText.substring(0, 400);
-            console.error('[Fathom] Anthropic API error:', response.status, snippet);
-            logErrorToSlack('warning', {
-                category: 'fathom',
-                action: 'translation.api_error',
-                message: `Anthropic ${response.status} translating summary`,
-                module: 'fathom-translator',
-                details: { status: response.status, model: MODEL, snippet },
-            });
-            return { text: markdown, status: 'failed', error: `HTTP ${response.status}: ${snippet}` };
-        }
-
-        const data = await response.json();
-        const translated = data.content?.[0]?.text?.trim();
+        const translated = provider === 'anthropic'
+            ? await callAnthropic(key, markdown)
+            : await callOpenAI(key, markdown);
         if (!translated) {
             logErrorToSlack('warning', {
-                category: 'fathom',
-                action: 'translation.empty_response',
-                message: 'Anthropic returned empty content',
+                category: 'fathom', action: 'translation.empty_response',
+                message: `${provider} returned empty content`,
                 module: 'fathom-translator',
-                details: { model: MODEL, raw: JSON.stringify(data).substring(0, 400) },
+                details: { provider, reason },
             });
-            return { text: markdown, status: 'failed', error: 'empty content from anthropic' };
+            return { text: markdown, status: 'failed', provider, error: `empty content from ${provider}` };
         }
-        return { text: translated, status: 'translated' };
+        return { text: translated, status: 'translated', provider };
     } catch (err) {
-        console.error('[Fathom] Translation failed:', err.message);
-        logErrorToSlack('error', {
-            category: 'fathom',
-            action: 'translation.exception',
-            message: err.message,
+        console.error(`[Fathom] Translation via ${provider} failed:`, err.message);
+        logErrorToSlack('warning', {
+            category: 'fathom', action: 'translation.api_error',
+            message: `${provider} error translating summary`,
             module: 'fathom-translator',
-            details: { model: MODEL, stack: err.stack?.substring(0, 400) },
+            details: { provider, reason, message: err.message?.substring(0, 400) },
         });
-        return { text: markdown, status: 'failed', error: err.message };
+        return { text: markdown, status: 'failed', provider, error: err.message };
     }
 }
