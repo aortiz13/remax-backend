@@ -37,6 +37,41 @@ Después de **cualquier** cambio de código en este repo:
 
 NO esperar a que el usuario lo pida. NO dejar cambios solo pusheados sin PR.
 
+## ⚠️ TIMELINE / HISTORIAL OBLIGATORIO PARA LEADS, CANDIDATOS, CONTACTOS Y PROPIEDADES
+
+**Toda actividad** generada sobre un lead, candidato, contacto o propiedad **debe quedar registrada** en su línea de tiempo (storyline / historial). Esto incluye: creación, asignación, cambio de estado, llamadas, emails enviados/abiertos/clickeados, mensajes WhatsApp, reuniones, notas, subida de documentos, cambios de etapa, transferencias, etc.
+
+### Tabla canónica: `activity_logs`
+
+```sql
+INSERT INTO activity_logs (
+    id, actor_id, action, entity_type, entity_id,
+    description, details, contact_id, property_id
+) VALUES (
+    gen_random_uuid(),
+    $actorId,            -- profiles.id del usuario que hizo la acción (null = sistema)
+    $action,             -- etiqueta corta: 'Lead Recibido', 'Email Enviado', 'Llamada Realizada'...
+    $entityType,         -- 'Lead' | 'Contact' | 'Property' | 'ExternalLead' | 'Candidate' | etc.
+    $entityId,           -- UUID del objeto principal de la acción
+    $description,        -- texto humano en español para mostrar en el timeline
+    $detailsJsonb,       -- JSONB con metadata extra (tracking_id, url, payload, etc.)
+    $contactId,          -- FK al contacto (para que aparezca en su historial)
+    $propertyId          -- FK a la propiedad (para que aparezca en su historial)
+);
+```
+
+### Reglas estrictas
+
+- ✅ **Siempre** insertar en `activity_logs` cuando se genere una actividad sobre lead/candidato/contacto/propiedad.
+- ✅ Si la actividad toca varios objetos (ej. lead + propiedad), llenar `contact_id` Y `property_id` para que aparezca en ambos timelines.
+- ✅ Usar `description` en español, redactada como aparecería al usuario final.
+- ✅ Guardar contexto útil en `details` (JSONB): IDs externos, URLs, payload del webhook, etc.
+- ✅ Si la acción es del sistema (cron, webhook, n8n), `actor_id` puede ser `null` o el `profiles.id` de un perfil de servicio.
+- ❌ NO crear nuevas tablas de "historial" paralelas — usar `activity_logs`.
+- ❌ NO omitir el log "porque es trivial" — el timeline es la fuente de verdad para auditoría.
+
+Ver ejemplos vivos en `src/routes/tracking.js`, `src/routes/webForms.js`.
+
 ## Infraestructura real
 
 | Servicio | URL |
