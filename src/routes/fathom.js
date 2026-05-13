@@ -244,7 +244,7 @@ router.get('/recordings', async (req, res) => {
                 m.id, m.candidate_id, m.fathom_recording_id, m.fathom_share_url, m.fathom_meeting_url,
                 m.recording_duration_seconds, m.summary, m.started_at, m.ended_at, m.created_at,
                 m.form_applied,
-                c.first_name, c.last_name, c.email, c.pipeline_stage, c.avatar_url
+                c.first_name, c.last_name, c.email, c.pipeline_stage
              FROM recruitment_meetings m
              JOIN recruitment_candidates c ON c.id = m.candidate_id
              WHERE ${filters.join(' AND ')}
