@@ -195,7 +195,7 @@ async function ingestFathomMeeting(payload, { eventType = 'meeting_content_ready
 
     const transcriptText = buildTranscriptText(payload);
     const rawSummary = extractSummary(payload);
-    const summary = rawSummary ? await translateSummaryToSpanish(rawSummary) : null;
+    const summary = rawSummary ? (await translateSummaryToSpanish(rawSummary)).text : null;
     const actionItems = extractActionItems(payload);
     const startedAt = payload.recording_start_time || payload.scheduled_start_time || payload.created_at || null;
     const endedAt = payload.recording_end_time || payload.scheduled_end_time || null;
@@ -443,6 +443,8 @@ router.post('/reprocess', async (req, res) => {
         );
 
         let updated = 0, skipped_no_payload = 0;
+        const translationStats = { translated: 0, no_key: 0, empty: 0, failed: 0, skipped: 0 };
+        const translationErrors = [];
         const errors = [];
 
         for (const meeting of meetings) {
@@ -458,7 +460,17 @@ router.post('/reprocess', async (req, res) => {
 
                 const payload = events[0].payload;
                 const rawSummary = extractSummary(payload);
-                const summary = rawSummary ? await translateSummaryToSpanish(rawSummary) : null;
+                let summary = null;
+                if (rawSummary) {
+                    const tr = await translateSummaryToSpanish(rawSummary);
+                    summary = tr.text;
+                    translationStats[tr.status] = (translationStats[tr.status] || 0) + 1;
+                    if (tr.status === 'failed' && translationErrors.length < 5) {
+                        translationErrors.push({ meeting_id: meeting.id, error: tr.error });
+                    }
+                } else {
+                    translationStats.skipped++;
+                }
                 const transcriptText = buildTranscriptText(payload);
                 const actionItems = extractActionItems(payload);
 
@@ -481,6 +493,8 @@ router.post('/reprocess', async (req, res) => {
             total_candidates: meetings.length,
             updated,
             skipped_no_payload,
+            translation: translationStats,
+            translation_errors: translationErrors,
             errors,
         });
     } catch (err) {
