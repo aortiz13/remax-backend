@@ -80,21 +80,30 @@ function buildTranscriptText(payload) {
     return '';
 }
 
-// Fathom may send summary as string, markdown, or { markdown, text, body, overview }.
+// Fathom may send summary as string, markdown, or an object like
+// { template_name, markdown_formatted } (the actual shape returned by their
+// /external/v1/meetings endpoint under default_summary).
 function extractSummary(payload) {
     const candidates = [
         payload.summary,
-        payload.ai_summary,
-        payload.default_summary,
-        payload.summary_overview,
-        payload.summary_markdown,
-        payload.notes,
-        payload.ai_notes,
+        payload.summary?.markdown_formatted,
         payload.summary?.markdown,
         payload.summary?.text,
         payload.summary?.body,
         payload.summary?.overview,
         payload.summary?.content,
+        payload.default_summary,
+        payload.default_summary?.markdown_formatted,
+        payload.default_summary?.markdown,
+        payload.default_summary?.text,
+        payload.default_summary?.body,
+        payload.default_summary?.content,
+        payload.ai_summary,
+        payload.ai_summary?.markdown_formatted,
+        payload.summary_overview,
+        payload.summary_markdown,
+        payload.notes,
+        payload.ai_notes,
     ];
     for (const c of candidates) {
         if (typeof c === 'string' && c.trim()) return c;
@@ -408,6 +417,72 @@ router.post('/backfill', async (req, res) => {
             message: err.message, module: 'fathom-backfill',
         });
         res.status(500).json({ error: err.message, partial_stats: stats });
+    }
+});
+
+// ─── POST /api/fathom/reprocess — Re-extract from stored payloads ─────────
+// Useful after the parser is upgraded to recognize new field shapes. Pulls
+// the raw payload from fathom_webhook_events and re-runs the helpers; does
+// NOT call Fathom's API again.
+router.post('/reprocess', async (req, res) => {
+    const onlyMissing = req.body?.only_missing !== false; // default true
+
+    const where = onlyMissing
+        ? `WHERE m.meeting_source = 'fathom'
+              AND (m.summary IS NULL OR m.transcript_text IS NULL OR m.transcript_text = ''
+                   OR m.action_items IS NULL)`
+        : `WHERE m.meeting_source = 'fathom'`;
+
+    try {
+        const { rows: meetings } = await pool.query(
+            `SELECT m.id, m.fathom_recording_id
+             FROM recruitment_meetings m
+             ${where}`
+        );
+
+        let updated = 0, skipped_no_payload = 0;
+        const errors = [];
+
+        for (const meeting of meetings) {
+            try {
+                const { rows: events } = await pool.query(
+                    `SELECT payload FROM fathom_webhook_events
+                     WHERE fathom_recording_id = $1
+                       AND status IN ('ingested', 'duplicate')
+                     ORDER BY received_at DESC LIMIT 1`,
+                    [meeting.fathom_recording_id]
+                );
+                if (!events[0]) { skipped_no_payload++; continue; }
+
+                const payload = events[0].payload;
+                const summary = extractSummary(payload);
+                const transcriptText = buildTranscriptText(payload);
+                const actionItems = extractActionItems(payload);
+
+                await pool.query(
+                    `UPDATE recruitment_meetings SET
+                        summary         = COALESCE($1, summary),
+                        transcript_text = COALESCE(NULLIF($2, ''), transcript_text),
+                        action_items    = COALESCE($3::jsonb, action_items),
+                        updated_at      = NOW()
+                     WHERE id = $4`,
+                    [summary, transcriptText, actionItems ? JSON.stringify(actionItems) : null, meeting.id]
+                );
+                updated++;
+            } catch (err) {
+                if (errors.length < 10) errors.push({ meeting_id: meeting.id, message: err.message });
+            }
+        }
+
+        res.json({
+            total_candidates: meetings.length,
+            updated,
+            skipped_no_payload,
+            errors,
+        });
+    } catch (err) {
+        console.error('[Fathom] Reprocess error:', err);
+        res.status(500).json({ error: err.message });
     }
 });
 
