@@ -414,6 +414,89 @@ router.post('/leads/webhook', async (req, res) => {
 });
 
 // ============================================================
+// POST /api/recruitment/candidates/:id/post-meeting-decision
+// Dispara el workflow n8n de Aprobado/Desaprobado luego de la reunión presencial.
+// El frontend ya escribe el pipeline_stage en la DB vía PostgREST; este endpoint
+// se encarga únicamente de notificar a n8n para que envíe el email correspondiente.
+// ============================================================
+const POST_MEETING_WEBHOOK_URL =
+    process.env.N8N_POST_MEETING_WEBHOOK_URL ||
+    'https://workflow.remax-exclusive.cl/webhook/candidato-decision';
+
+router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
+    const { id } = req.params;
+    const { decision } = req.body || {};
+
+    const normalized = String(decision || '').toLowerCase();
+    if (normalized !== 'aprobado' && normalized !== 'desaprobado') {
+        return res.status(400).json({ error: 'decision must be "aprobado" or "desaprobado"' });
+    }
+    const estado = normalized === 'aprobado' ? 'Aprobado' : 'Desaprobado';
+
+    try {
+        const { rows } = await pool.query(
+            `SELECT id, first_name, last_name, email
+               FROM recruitment_candidates
+              WHERE id = $1
+              LIMIT 1`,
+            [id],
+        );
+
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Candidate not found' });
+        }
+
+        const candidate = rows[0];
+        const fullName = `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim();
+
+        if (!candidate.email) {
+            logErrorToSlack('warning', {
+                category: 'recruitment',
+                action: 'post_meeting.missing_email',
+                message: `Candidato ${id} movido a ${estado} pero no tiene email`,
+                module: 'leads-decision',
+                details: { candidateId: id, estado },
+            });
+            return res.status(422).json({ error: 'Candidate has no email', webhookTriggered: false });
+        }
+
+        const r = await fetch(POST_MEETING_WEBHOOK_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                Nombre: fullName || 'Candidato',
+                email: candidate.email,
+                estado,
+            }),
+        });
+
+        if (!r.ok) {
+            const body = await r.text().catch(() => '');
+            logErrorToSlack('error', {
+                category: 'recruitment',
+                action: 'post_meeting.webhook_error',
+                message: `n8n webhook respondió ${r.status}`,
+                module: 'leads-decision',
+                details: { candidateId: id, estado, status: r.status, body: body.slice(0, 500) },
+            });
+            return res.status(502).json({ error: 'n8n webhook failed', status: r.status });
+        }
+
+        res.json({ success: true, candidateId: id, estado, webhookTriggered: true });
+    } catch (error) {
+        console.error('Post-meeting decision error:', error);
+        logErrorToSlack('error', {
+            category: 'recruitment',
+            action: 'post_meeting.error',
+            message: error.message,
+            module: 'leads-decision',
+            details: { candidateId: id, estado },
+        });
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
 // POST /api/recruitment/leads/from-email — Process web form email
 // Called by the cron worker
 // ============================================================
