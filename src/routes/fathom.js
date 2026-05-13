@@ -47,17 +47,78 @@ function extractInviteeEmails(payload) {
 }
 
 function buildTranscriptText(payload) {
-    if (typeof payload.transcript === 'string') return payload.transcript;
-    if (Array.isArray(payload.transcript)) {
-        return payload.transcript
+    // Fathom payload shapes seen in the wild:
+    //   payload.transcript: string | array of turns
+    //   payload.transcript_plaintext / transcript_text: string
+    //   payload.transcript.markdown / transcript.text: string (object form)
+    const candidates = [
+        payload.transcript,
+        payload.transcript_plaintext,
+        payload.transcript_text,
+        payload.transcript?.markdown,
+        payload.transcript?.text,
+        payload.transcript?.content,
+    ];
+    for (const c of candidates) {
+        if (typeof c === 'string' && c.trim()) return c;
+    }
+    const turns = Array.isArray(payload.transcript) ? payload.transcript
+        : Array.isArray(payload.transcript?.turns) ? payload.transcript.turns
+        : null;
+    if (turns) {
+        return turns
             .map(t => {
-                const who = t?.speaker?.display_name || 'Unknown';
-                const ts = t?.timestamp ? `[${t.timestamp}] ` : '';
-                return `${ts}${who}: ${t?.text || ''}`;
+                const who = t?.speaker?.display_name || t?.speaker?.name || t?.speaker || 'Unknown';
+                const ts = t?.timestamp || t?.time || t?.start_time;
+                const tsStr = ts ? `[${ts}] ` : '';
+                const text = t?.text || t?.content || t?.transcript || '';
+                return `${tsStr}${who}: ${text}`;
             })
+            .filter(line => line.trim().length > 0)
             .join('\n');
     }
     return '';
+}
+
+// Fathom may send summary as string, markdown, or { markdown, text, body, overview }.
+function extractSummary(payload) {
+    const candidates = [
+        payload.summary,
+        payload.ai_summary,
+        payload.default_summary,
+        payload.summary_overview,
+        payload.summary_markdown,
+        payload.notes,
+        payload.ai_notes,
+        payload.summary?.markdown,
+        payload.summary?.text,
+        payload.summary?.body,
+        payload.summary?.overview,
+        payload.summary?.content,
+    ];
+    for (const c of candidates) {
+        if (typeof c === 'string' && c.trim()) return c;
+    }
+    return null;
+}
+
+// Normalize action_items to a JSON array of { description } objects.
+function extractActionItems(payload) {
+    const raw = payload.action_items ?? payload.actions ?? payload.action_item_list ?? payload.tasks;
+    if (!raw) return null;
+    const arr = Array.isArray(raw) ? raw
+        : Array.isArray(raw.items) ? raw.items
+        : Array.isArray(raw.action_items) ? raw.action_items
+        : null;
+    if (!arr || arr.length === 0) return null;
+    return arr.map(item => {
+        if (typeof item === 'string') return { description: item };
+        return {
+            description: item?.description || item?.text || item?.title || item?.body || JSON.stringify(item),
+            assignee:    item?.assignee || item?.assigned_to || null,
+            due_date:    item?.due_date || item?.deadline || null,
+        };
+    });
 }
 
 async function findCandidateByEmails(emails) {
@@ -123,6 +184,8 @@ async function ingestFathomMeeting(payload, { eventType = 'meeting_content_ready
     }
 
     const transcriptText = buildTranscriptText(payload);
+    const summary = extractSummary(payload);
+    const actionItems = extractActionItems(payload);
     const startedAt = payload.recording_start_time || payload.scheduled_start_time || payload.created_at || null;
     const endedAt = payload.recording_end_time || payload.scheduled_end_time || null;
     const durationSeconds = (startedAt && endedAt)
@@ -156,8 +219,8 @@ async function ingestFathomMeeting(payload, { eventType = 'meeting_content_ready
             fathomRecordingId, payload.share_url || null, payload.url || null,
             payload.share_url || payload.url || null, durationSeconds, 'fathom',
             transcriptText, JSON.stringify(payload.transcript || null),
-            payload.summary || payload.ai_summary || null,
-            payload.action_items ? JSON.stringify(payload.action_items) : null,
+            summary,
+            actionItems ? JSON.stringify(actionItems) : null,
             'recruitment_interview', payload.meeting_type || 'fathom', 'fathom',
             emails,
             startedAt, endedAt,
@@ -365,6 +428,37 @@ router.get('/recordings/stats', async (req, res) => {
         res.json(rows[0]);
     } catch (err) {
         console.error('[Fathom] Stats error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── GET /api/fathom/debug/last-payload — Inspect the most recent webhook ──
+// Helpful when fields like summary/transcript come back empty: shows what
+// Fathom actually sent so we know which keys to map.
+router.get('/debug/last-payload', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT received_at, event_type, status, fathom_recording_id, matched_email,
+                    jsonb_object_keys(payload) AS keys
+             FROM fathom_webhook_events
+             ORDER BY received_at DESC LIMIT 1`
+        );
+        if (!rows[0]) return res.json({ events: 0 });
+        const { rows: full } = await pool.query(
+            `SELECT received_at, event_type, status, fathom_recording_id, matched_email, payload
+             FROM fathom_webhook_events
+             ORDER BY received_at DESC LIMIT 1`
+        );
+        res.json({
+            received_at: full[0].received_at,
+            event_type:  full[0].event_type,
+            status:      full[0].status,
+            fathom_recording_id: full[0].fathom_recording_id,
+            matched_email:       full[0].matched_email,
+            top_level_keys: rows.map(r => r.keys),
+            payload: full[0].payload,
+        });
+    } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
