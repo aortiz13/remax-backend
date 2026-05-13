@@ -30,6 +30,11 @@ router.post('/web-forms', async (req, res) => {
             return res.json({ success: true, ...result });
         }
 
+        if (formType === 'postular') {
+            const result = await processPostularForm(body);
+            return res.json({ success: true, ...result });
+        }
+
         return res.status(400).json({ error: `Unknown form_type: ${formType}` });
     } catch (error) {
         console.error('Web form webhook error:', error);
@@ -842,5 +847,117 @@ function mapNeedFromTransaction(tipo) {
     if (t === 'ARRENDATARIO') return 'Arrendar';
     return 'Otro';
 }
+
+// ============================================================
+// Process "Postular" form — public recruitment application
+// (replaces Google Forms /SolicitudIngresoExclusive)
+// ============================================================
+async function processPostularForm(data) {
+    const candidateId = data.candidate_id || null;
+
+    const firstName       = (data.first_name || '').trim();
+    const lastName        = (data.last_name  || '').trim();
+    const email           = data.email           || null;
+    const phone           = data.phone           || null;
+    const rut             = data.rut             || null;
+    const birthDate       = data.birth_date      || null;
+    const maritalStatus   = data.marital_status  || null;
+    const address         = data.address         || null;
+    const currentCompany  = data.current_company || null;
+    const jobTitle        = data.job_title       || null;
+    const educationLevel  = data.education_level || null;
+
+    let row;
+    let isUpdate = false;
+
+    if (candidateId) {
+        const { rows } = await pool.query(`
+            UPDATE recruitment_candidates SET
+                first_name      = COALESCE(NULLIF($2, ''), first_name),
+                last_name       = COALESCE(NULLIF($3, ''), last_name),
+                email           = COALESCE($4, email),
+                phone           = COALESCE($5, phone),
+                rut             = COALESCE($6, rut),
+                birth_date      = COALESCE($7::date, birth_date),
+                marital_status  = COALESCE($8, marital_status),
+                address         = COALESCE($9, address),
+                current_company = COALESCE($10, current_company),
+                job_title       = COALESCE($11, job_title),
+                education_level = COALESCE($12, education_level),
+                application_submitted_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING id, first_name, last_name, email
+        `, [candidateId, firstName, lastName, email, phone, rut, birthDate,
+            maritalStatus, address, currentCompany, jobTitle, educationLevel]);
+
+        if (!rows.length) {
+            const err = new Error('Candidate not found');
+            err.statusCode = 404;
+            throw err;
+        }
+        row = rows[0];
+        isUpdate = true;
+    } else {
+        const { rows } = await pool.query(`
+            INSERT INTO recruitment_candidates (
+                first_name, last_name, email, phone, rut,
+                birth_date, marital_status, address,
+                current_company, job_title, education_level,
+                source, pipeline_stage, application_submitted_at
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8,
+                $9, $10, $11,
+                'Web - Postulación', 'nuevo_lead', NOW()
+            ) RETURNING id, first_name, last_name, email
+        `, [firstName, lastName, email, phone, rut,
+            birthDate, maritalStatus, address,
+            currentCompany, jobTitle, educationLevel]);
+        row = rows[0];
+    }
+
+    logErrorToSlack('info', {
+        category: 'web-forms',
+        action: isUpdate ? 'postular.updated' : 'postular.created',
+        message: isUpdate
+            ? `📝 Postulación completada: ${firstName} ${lastName} (${email || 'sin email'}) → candidato ${row.id}`
+            : `🆕 Nueva postulación web: ${firstName} ${lastName} (${email || 'sin email'})`,
+        module: 'web-forms',
+        details: { candidateId: row.id, email, phone, rut },
+    });
+
+    return { candidateId: row.id, isUpdate };
+}
+
+// ============================================================
+// GET /api/webhooks/web-forms/recruitment-prefill/:cid
+// Returns minimal candidate data so the public /postular form
+// can pre-fill name + email when a recruiter shares the link.
+// ============================================================
+router.get('/web-forms/recruitment-prefill/:cid', async (req, res) => {
+    try {
+        const secret = req.headers['x-wf-secret'];
+        if (secret !== FORM_SECRET) {
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+
+        const { cid } = req.params;
+        const { rows: [candidate] } = await pool.query(`
+            SELECT id, first_name, last_name, email, phone, rut,
+                   birth_date, marital_status, address,
+                   current_company, job_title, education_level,
+                   pipeline_stage
+            FROM recruitment_candidates
+            WHERE id = $1
+        `, [cid]);
+
+        if (!candidate) return res.status(404).json({ error: 'Candidate not found' });
+        return res.json({ candidate });
+    } catch (error) {
+        console.error('Recruitment prefill error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
 
 export default router;
