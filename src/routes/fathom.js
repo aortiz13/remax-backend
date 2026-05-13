@@ -86,6 +86,95 @@ async function logWebhookEvent({ eventType, fathomRecordingId, candidateId, meet
     }
 }
 
+// Core ingestion: shared by webhook and backfill. Returns { status, meeting?, candidate_id?, emails }
+async function ingestFathomMeeting(payload, { eventType = 'meeting_content_ready' } = {}) {
+    const fathomRecordingId =
+        payload.recording_id ||
+        payload.id ||
+        (payload.url ? payload.url.split('/').pop() : null);
+
+    const emails = extractInviteeEmails(payload);
+    const candidate = await findCandidateByEmails(emails);
+
+    if (!candidate) {
+        await logWebhookEvent({
+            eventType, fathomRecordingId,
+            candidateId: null, meetingId: null,
+            matchedEmail: emails[0] || null,
+            status: 'no_match', errorMessage: null, payload,
+        });
+        return { status: 'no_match', emails, fathom_recording_id: fathomRecordingId };
+    }
+
+    if (fathomRecordingId) {
+        const { rows: existing } = await pool.query(
+            'SELECT id FROM recruitment_meetings WHERE fathom_recording_id = $1',
+            [fathomRecordingId]
+        );
+        if (existing[0]) {
+            await logWebhookEvent({
+                eventType, fathomRecordingId,
+                candidateId: candidate.id, meetingId: existing[0].id,
+                matchedEmail: candidate.email,
+                status: 'duplicate', errorMessage: null, payload,
+            });
+            return { status: 'duplicate', meeting_id: existing[0].id, candidate_id: candidate.id };
+        }
+    }
+
+    const transcriptText = buildTranscriptText(payload);
+    const startedAt = payload.recording_start_time || payload.scheduled_start_time || payload.created_at || null;
+    const endedAt = payload.recording_end_time || payload.scheduled_end_time || null;
+    const durationSeconds = (startedAt && endedAt)
+        ? Math.max(0, Math.round((new Date(endedAt) - new Date(startedAt)) / 1000))
+        : null;
+
+    const meetingId = crypto.randomUUID();
+    const { rows } = await pool.query(
+        `INSERT INTO recruitment_meetings (
+            id, candidate_id,
+            fathom_recording_id, fathom_share_url, fathom_meeting_url,
+            recording_url, recording_duration_seconds, recording_format,
+            transcript_text, transcript_json,
+            summary, action_items,
+            meeting_type, meeting_platform, meeting_source,
+            invitee_emails,
+            started_at, ended_at, created_at, updated_at
+         ) VALUES (
+            $1, $2,
+            $3, $4, $5,
+            $6, $7, $8,
+            $9, $10,
+            $11, $12,
+            $13, $14, $15,
+            $16,
+            $17, $18, NOW(), NOW()
+         )
+         RETURNING *`,
+        [
+            meetingId, candidate.id,
+            fathomRecordingId, payload.share_url || null, payload.url || null,
+            payload.share_url || payload.url || null, durationSeconds, 'fathom',
+            transcriptText, JSON.stringify(payload.transcript || null),
+            payload.summary || payload.ai_summary || null,
+            payload.action_items ? JSON.stringify(payload.action_items) : null,
+            'recruitment_interview', payload.meeting_type || 'fathom', 'fathom',
+            emails,
+            startedAt, endedAt,
+        ]
+    );
+
+    await logWebhookEvent({
+        eventType, fathomRecordingId,
+        candidateId: candidate.id, meetingId,
+        matchedEmail: candidate.email,
+        status: 'ingested', errorMessage: null, payload,
+    });
+
+    console.log(`[Fathom] ✅ Ingested recording ${fathomRecordingId} for candidate ${candidate.id} (${candidate.email})`);
+    return { status: 'ingested', meeting: rows[0], candidate_id: candidate.id };
+}
+
 // ─── POST /api/fathom/webhook ─ Ingest Fathom meeting_content_ready ────────
 // IMPORTANT: this route is NOT behind authMiddleware — Fathom hits it directly.
 // Mounted before `router.use(authMiddleware)` below.
@@ -107,87 +196,9 @@ router.post('/webhook', async (req, res) => {
     }
 
     try {
-        const emails = extractInviteeEmails(payload);
-        const candidate = await findCandidateByEmails(emails);
-
-        if (!candidate) {
-            await logWebhookEvent({
-                eventType, fathomRecordingId,
-                candidateId: null, meetingId: null,
-                matchedEmail: emails[0] || null,
-                status: 'no_match', errorMessage: null, payload,
-            });
-            return res.status(202).json({ status: 'no_match', emails });
-        }
-
-        // Idempotency: if this recording already ingested, return it.
-        if (fathomRecordingId) {
-            const { rows: existing } = await pool.query(
-                'SELECT id FROM recruitment_meetings WHERE fathom_recording_id = $1',
-                [fathomRecordingId]
-            );
-            if (existing[0]) {
-                await logWebhookEvent({
-                    eventType, fathomRecordingId,
-                    candidateId: candidate.id, meetingId: existing[0].id,
-                    matchedEmail: candidate.email,
-                    status: 'duplicate', errorMessage: null, payload,
-                });
-                return res.json({ status: 'duplicate', meeting_id: existing[0].id });
-            }
-        }
-
-        const transcriptText = buildTranscriptText(payload);
-        const startedAt = payload.recording_start_time || payload.scheduled_start_time || payload.created_at || null;
-        const endedAt = payload.recording_end_time || payload.scheduled_end_time || null;
-        const durationSeconds = (startedAt && endedAt)
-            ? Math.max(0, Math.round((new Date(endedAt) - new Date(startedAt)) / 1000))
-            : null;
-
-        const meetingId = crypto.randomUUID();
-        const { rows } = await pool.query(
-            `INSERT INTO recruitment_meetings (
-                id, candidate_id,
-                fathom_recording_id, fathom_share_url, fathom_meeting_url,
-                recording_url, recording_duration_seconds, recording_format,
-                transcript_text, transcript_json,
-                summary, action_items,
-                meeting_type, meeting_platform, meeting_source,
-                invitee_emails,
-                started_at, ended_at, created_at, updated_at
-             ) VALUES (
-                $1, $2,
-                $3, $4, $5,
-                $6, $7, $8,
-                $9, $10,
-                $11, $12,
-                $13, $14, $15,
-                $16,
-                $17, $18, NOW(), NOW()
-             )
-             RETURNING *`,
-            [
-                meetingId, candidate.id,
-                fathomRecordingId, payload.share_url || null, payload.url || null,
-                payload.share_url || payload.url || null, durationSeconds, 'fathom',
-                transcriptText, JSON.stringify(payload.transcript || null),
-                payload.summary || payload.ai_summary || null,
-                payload.action_items ? JSON.stringify(payload.action_items) : null,
-                'recruitment_interview', payload.meeting_type || 'fathom', 'fathom',
-                emails,
-                startedAt, endedAt,
-            ]
-        );
-
-        await logWebhookEvent({
-            eventType, fathomRecordingId,
-            candidateId: candidate.id, meetingId,
-            matchedEmail: candidate.email,
-            status: 'ingested', errorMessage: null, payload,
-        });
-
-        console.log(`[Fathom] ✅ Ingested recording ${fathomRecordingId} for candidate ${candidate.id} (${candidate.email})`);
-        res.json({ status: 'ingested', meeting: rows[0], candidate_id: candidate.id });
+        const result = await ingestFathomMeeting(payload, { eventType });
+        const httpStatus = result.status === 'no_match' ? 202 : 200;
+        res.status(httpStatus).json(result);
     } catch (err) {
         console.error('[Fathom] Webhook error:', err);
         logErrorToSlack('error', {
@@ -256,6 +267,84 @@ router.get('/recordings', async (req, res) => {
     } catch (err) {
         console.error('[Fathom] List recordings error:', err);
         res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── POST /api/fathom/backfill — Pull historic meetings from Fathom API ─────
+// Body: { from?: ISO, to?: ISO, max_pages?: number }
+// Requires FATHOM_API_KEY env var. Reuses ingestFathomMeeting() so the result
+// looks identical to webhook ingestion (same rows, same audit log).
+router.post('/backfill', async (req, res) => {
+    const apiKey = process.env.FATHOM_API_KEY;
+    if (!apiKey) {
+        return res.status(400).json({
+            error: 'FATHOM_API_KEY not configured on the server. Set it in EasyPanel (service remax-app) and redeploy.',
+        });
+    }
+
+    const { from, to } = req.body || {};
+    const maxPages = Math.min(parseInt(req.body?.max_pages, 10) || 20, 100);
+
+    const stats = { total: 0, ingested: 0, duplicate: 0, no_match: 0, error: 0, pages: 0 };
+    const errors = [];
+    const noMatchSample = [];
+
+    try {
+        let cursor = null;
+        for (let page = 0; page < maxPages; page++) {
+            const url = new URL('https://api.fathom.ai/external/v1/meetings');
+            url.searchParams.set('include_transcript', 'true');
+            url.searchParams.set('include_summary', 'true');
+            url.searchParams.set('include_action_items', 'true');
+            url.searchParams.set('include_crm_matches', 'true');
+            if (from)   url.searchParams.set('created_after',  new Date(from).toISOString());
+            if (to)     url.searchParams.set('created_before', new Date(to).toISOString());
+            if (cursor) url.searchParams.set('cursor', cursor);
+
+            const fetchRes = await fetch(url.toString(), {
+                headers: { 'X-Api-Key': apiKey, 'Accept': 'application/json' },
+            });
+
+            if (!fetchRes.ok) {
+                const body = await fetchRes.text();
+                throw new Error(`Fathom API ${fetchRes.status}: ${body.substring(0, 300)}`);
+            }
+
+            const data = await fetchRes.json();
+            // Fathom may return { items: [...], next_cursor } or just an array — handle both.
+            const items = Array.isArray(data) ? data : (data.items || data.meetings || data.results || []);
+            cursor = data.next_cursor || data.cursor || null;
+            stats.pages++;
+
+            for (const meeting of items) {
+                stats.total++;
+                try {
+                    const result = await ingestFathomMeeting(meeting, { eventType: 'backfill' });
+                    stats[result.status] = (stats[result.status] || 0) + 1;
+                    if (result.status === 'no_match' && noMatchSample.length < 10) {
+                        noMatchSample.push({ emails: result.emails, recording_id: result.fathom_recording_id });
+                    }
+                } catch (err) {
+                    stats.error++;
+                    if (errors.length < 10) errors.push({ message: err.message });
+                    console.error('[Fathom] Backfill ingest error:', err.message);
+                }
+            }
+
+            if (!cursor || items.length === 0) break;
+            // Light pacing for Fathom's 60 req/min limit.
+            await new Promise(r => setTimeout(r, 250));
+        }
+
+        console.log(`[Fathom] ✅ Backfill done: ${JSON.stringify(stats)}`);
+        res.json({ ...stats, errors, no_match_sample: noMatchSample });
+    } catch (err) {
+        console.error('[Fathom] Backfill failed:', err);
+        logErrorToSlack('error', {
+            category: 'fathom', action: 'backfill.failed',
+            message: err.message, module: 'fathom-backfill',
+        });
+        res.status(500).json({ error: err.message, partial_stats: stats });
     }
 });
 
