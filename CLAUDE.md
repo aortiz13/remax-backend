@@ -1,5 +1,31 @@
 # RE/MAX Exclusive — Backend API
 
+## ⚠️ CONFIGURACIÓN OBLIGATORIA — NO PREGUNTAR
+
+Estos valores son **fijos y autoritativos** para este proyecto. NO preguntar al usuario, NO sugerir Supabase, NO buscar credenciales en otros lugares.
+
+### Base de datos (PostgreSQL auto-hospedado en EasyPanel — NO ES SUPABASE)
+
+```
+postgres://postgres:5a58ca9a00e2837be764@panel.remax-exclusive.cl:5432/postgres?sslmode=disable
+```
+
+| Campo | Valor |
+|-------|-------|
+| Host | `panel.remax-exclusive.cl` |
+| Puerto | `5432` |
+| Usuario | `postgres` |
+| Password | `5a58ca9a00e2837be764` |
+| Database | `postgres` |
+| SSL mode | `disable` |
+
+**Reglas estrictas:**
+- ❌ NO usar el MCP de Supabase ni cualquier herramienta de Supabase.
+- ❌ NO sugerir "verificar en Supabase dashboard" ni similares.
+- ❌ NO pedir al usuario credenciales de DB — usar las de arriba.
+- ✅ Usar `psql` directo o `pg` Pool con el string completo de arriba.
+- ✅ Todo es PostgreSQL crudo, auto-hospedado vía EasyPanel.
+
 ## Infraestructura real
 
 | Servicio | URL |
