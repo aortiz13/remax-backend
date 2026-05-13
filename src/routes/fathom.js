@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import pool from '../lib/db.js';
 import authMiddleware from '../middleware/auth.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
+import { translateSummaryToSpanish } from '../services/fathomTranslator.js';
 
 const router = express.Router();
 
@@ -193,7 +194,8 @@ async function ingestFathomMeeting(payload, { eventType = 'meeting_content_ready
     }
 
     const transcriptText = buildTranscriptText(payload);
-    const summary = extractSummary(payload);
+    const rawSummary = extractSummary(payload);
+    const summary = rawSummary ? await translateSummaryToSpanish(rawSummary) : null;
     const actionItems = extractActionItems(payload);
     const startedAt = payload.recording_start_time || payload.scheduled_start_time || payload.created_at || null;
     const endedAt = payload.recording_end_time || payload.scheduled_end_time || null;
@@ -455,7 +457,8 @@ router.post('/reprocess', async (req, res) => {
                 if (!events[0]) { skipped_no_payload++; continue; }
 
                 const payload = events[0].payload;
-                const summary = extractSummary(payload);
+                const rawSummary = extractSummary(payload);
+                const summary = rawSummary ? await translateSummaryToSpanish(rawSummary) : null;
                 const transcriptText = buildTranscriptText(payload);
                 const actionItems = extractActionItems(payload);
 
