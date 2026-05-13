@@ -26,6 +26,17 @@ postgres://postgres:5a58ca9a00e2837be764@panel.remax-exclusive.cl:5432/postgres?
 - ✅ Usar `psql` directo o `pg` Pool con el string completo de arriba.
 - ✅ Todo es PostgreSQL crudo, auto-hospedado vía EasyPanel.
 
+## ⚠️ FLUJO DE TRABAJO OBLIGATORIO — SIEMPRE ABRIR PR
+
+Después de **cualquier** cambio de código en este repo:
+
+1. Commit con mensaje descriptivo.
+2. `git push -u origin <branch>`.
+3. **Abrir Pull Request automáticamente** con `mcp__github__create_pull_request` hacia `main`.
+4. Devolver la URL del PR al usuario.
+
+NO esperar a que el usuario lo pida. NO dejar cambios solo pusheados sin PR.
+
 ## Infraestructura real
 
 | Servicio | URL |
