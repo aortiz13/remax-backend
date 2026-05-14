@@ -1,6 +1,7 @@
 import express from 'express';
 import pool from '../lib/db.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
+import { emailQueue } from '../queues/index.js';
 
 const router = express.Router();
 
@@ -415,13 +416,21 @@ router.post('/leads/webhook', async (req, res) => {
 
 // ============================================================
 // POST /api/recruitment/candidates/:id/post-meeting-decision
-// Dispara el workflow n8n de Aprobado/Desaprobado luego de la reunión presencial.
-// El frontend ya escribe el pipeline_stage en la DB vía PostgREST; este endpoint
-// se encarga únicamente de notificar a n8n para que envíe el email correspondiente.
+// Envía el email de Aprobación o Rechazo al mover el candidato post-reunión.
+// Toma la plantilla por defecto de `recruitment_email_templates` (category =
+// 'Aprobación' o 'Rechazo'), renderiza variables, encola el envío vía
+// emprendedores@ y adjunta el PDF de "Por qué ser un Agente RE/MAX" si aplica.
 // ============================================================
-const POST_MEETING_WEBHOOK_URL =
-    process.env.N8N_POST_MEETING_WEBHOOK_URL ||
-    'https://workflow.remax-exclusive.cl/webhook/candidato-decision';
+const APROBADO_PDF_URL = process.env.APROBADO_PDF_URL ||
+    'https://res.cloudinary.com/dhzmkxbek/image/upload/v1771201266/Por_que%CC%81_ser_un_Agente_REMAX_-_I_Trimestre_2026_veqbvc.pdf';
+
+function renderTemplateVars(text, vars) {
+    let out = String(text || '');
+    for (const [key, value] of Object.entries(vars)) {
+        out = out.split(key).join(value);
+    }
+    return out;
+}
 
 router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
     const { id } = req.params;
@@ -432,10 +441,11 @@ router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
         return res.status(400).json({ error: 'decision must be "aprobado" or "desaprobado"' });
     }
     const estado = normalized === 'aprobado' ? 'Aprobado' : 'Desaprobado';
+    const templateCategory = normalized === 'aprobado' ? 'Aprobación' : 'Rechazo';
 
     try {
         const { rows } = await pool.query(
-            `SELECT id, first_name, last_name, email
+            `SELECT id, first_name, last_name, email, phone, whatsapp, city
                FROM recruitment_candidates
               WHERE id = $1
               LIMIT 1`,
@@ -447,7 +457,7 @@ router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
         }
 
         const candidate = rows[0];
-        const fullName = `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim();
+        const fullName = `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato';
 
         if (!candidate.email) {
             logErrorToSlack('warning', {
@@ -457,33 +467,101 @@ router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
                 module: 'leads-decision',
                 details: { candidateId: id, estado },
             });
-            return res.status(422).json({ error: 'Candidate has no email', webhookTriggered: false });
+            return res.status(422).json({ error: 'Candidate has no email', emailSent: false });
         }
 
-        const r = await fetch(POST_MEETING_WEBHOOK_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                Nombre: fullName || 'Candidato',
-                email: candidate.email,
-                estado,
-                candidate_id: id,
-            }),
-        });
+        // Pick default template for this decision
+        const { rows: tplRows } = await pool.query(
+            `SELECT id, subject, body_html
+               FROM recruitment_email_templates
+              WHERE category = $1 AND is_default = true
+              ORDER BY updated_at DESC NULLS LAST
+              LIMIT 1`,
+            [templateCategory],
+        );
 
-        if (!r.ok) {
-            const body = await r.text().catch(() => '');
+        if (tplRows.length === 0) {
             logErrorToSlack('error', {
                 category: 'recruitment',
-                action: 'post_meeting.webhook_error',
-                message: `n8n webhook respondió ${r.status}`,
+                action: 'post_meeting.no_template',
+                message: `No hay plantilla default para categoría '${templateCategory}'`,
                 module: 'leads-decision',
-                details: { candidateId: id, estado, status: r.status, body: body.slice(0, 500) },
+                details: { candidateId: id, estado },
             });
-            return res.status(502).json({ error: 'n8n webhook failed', status: r.status });
+            return res.status(500).json({ error: `No default template configured for '${templateCategory}'` });
         }
+        const tpl = tplRows[0];
 
-        res.json({ success: true, candidateId: id, estado, webhookTriggered: true });
+        // Find recruitment Gmail account (emprendedores@)
+        const { rows: accountRows } = await pool.query(
+            `SELECT email_address FROM gmail_accounts WHERE purpose = 'recruitment' LIMIT 1`,
+        );
+        if (accountRows.length === 0) {
+            return res.status(400).json({
+                error: 'Recruitment Gmail account (emprendedores@) not connected. Connect it from /casilla first.',
+            });
+        }
+        const accountEmail = accountRows[0].email_address;
+
+        // Render template variables
+        const FORMS_URL = process.env.FORMS_URL || 'https://forms.remax-exclusive.cl';
+        const vars = {
+            '{{nombre}}': candidate.first_name || '',
+            '{{apellido}}': candidate.last_name || '',
+            '{{nombre_completo}}': fullName,
+            '{{email}}': candidate.email,
+            '{{telefono}}': candidate.phone || candidate.whatsapp || '',
+            '{{ciudad}}': candidate.city || '',
+            '{{form_url}}': `${FORMS_URL}/postular?cid=${id}`,
+            '{{oficinas_url}}': 'https://rem.ax/OficinasREMAXChile',
+            '{{candidate_id}}': id,
+        };
+        const subject = renderTemplateVars(tpl.subject, vars);
+        const bodyHtml = renderTemplateVars(tpl.body_html, vars);
+
+        // PDF de presentación solo para el email de Aprobado
+        const attachments = estado === 'Aprobado'
+            ? [{
+                url: APROBADO_PDF_URL,
+                filename: 'Por que ser un Agente RE-MAX.pdf',
+                mimeType: 'application/pdf',
+            }]
+            : [];
+
+        // Enqueue email send
+        await emailQueue.add('send-recruitment-email', {
+            accountEmail,
+            to: candidate.email,
+            subject,
+            bodyHtml,
+            candidateId: id,
+            templateId: tpl.id,
+            attachments,
+            sentBy: null,
+        }, {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 5000 },
+        });
+
+        // Initial log
+        await pool.query(`
+            INSERT INTO recruitment_email_logs
+                (candidate_id, email_type, subject, body_html, to_email, status, sent_at, metadata)
+            VALUES ($1, $2, $3, $4, $5, 'queued', NOW(), $6)
+        `, [
+            id, estado, subject, bodyHtml, candidate.email,
+            JSON.stringify({ template_id: tpl.id, trigger: 'post_meeting_decision' }),
+        ]);
+
+        logErrorToSlack('info', {
+            category: 'recruitment',
+            action: 'post_meeting.email_queued',
+            message: `📧 Email ${estado} encolado para ${fullName} (${candidate.email})`,
+            module: 'leads-decision',
+            details: { candidateId: id, templateId: tpl.id },
+        });
+
+        res.json({ success: true, candidateId: id, estado, emailQueued: true });
     } catch (error) {
         console.error('Post-meeting decision error:', error);
         logErrorToSlack('error', {
@@ -491,7 +569,7 @@ router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
             action: 'post_meeting.error',
             message: error.message,
             module: 'leads-decision',
-            details: { candidateId: id, estado },
+            details: { candidateId: id },
         });
         res.status(500).json({ error: error.message });
     }

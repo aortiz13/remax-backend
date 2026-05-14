@@ -292,7 +292,7 @@ router.post('/send', authMiddleware, async (req, res) => {
 // POST /api/gmail/send-recruitment — Send email via shared recruitment Gmail (emprendedores@)
 router.post('/send-recruitment', authMiddleware, async (req, res) => {
     try {
-        const { candidateId, toEmail, subject, bodyHtml, templateId, abVariant } = req.body;
+        const { candidateId, toEmail, subject, bodyHtml, templateId, abVariant, attachments } = req.body;
 
         if (!toEmail || !subject || !bodyHtml) {
             return res.status(400).json({ error: 'Missing required fields: toEmail, subject, bodyHtml' });
@@ -318,6 +318,7 @@ router.post('/send-recruitment', authMiddleware, async (req, res) => {
             candidateId,
             templateId,
             abVariant,
+            attachments: Array.isArray(attachments) ? attachments : [],
             sentBy: req.user.id,
         }, {
             attempts: 3,
