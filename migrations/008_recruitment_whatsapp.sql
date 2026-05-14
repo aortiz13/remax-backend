@@ -33,13 +33,25 @@ CREATE TABLE IF NOT EXISTS recruitment_whatsapp_templates (
 CREATE INDEX IF NOT EXISTS idx_whatsapp_templates_category
     ON recruitment_whatsapp_templates(category);
 
+-- Defensive: if the table already existed from a partial previous run,
+-- make sure all expected columns are present before any index references
+-- them.
+ALTER TABLE recruitment_whatsapp_templates
+    ADD COLUMN IF NOT EXISTS name       TEXT,
+    ADD COLUMN IF NOT EXISTS body       TEXT,
+    ADD COLUMN IF NOT EXISTS category   TEXT DEFAULT 'General',
+    ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS created_by UUID,
+    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+
 -- ─── 2. Logs ────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS recruitment_whatsapp_logs (
     id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     candidate_id             UUID,
     template_id              UUID,
     ab_variant               TEXT,           -- 'A' | 'B' | NULL
-    body                     TEXT NOT NULL,
+    body                     TEXT,
     to_phone                 TEXT,
     chatwoot_contact_id      BIGINT,
     chatwoot_conversation_id BIGINT,
@@ -48,6 +60,20 @@ CREATE TABLE IF NOT EXISTS recruitment_whatsapp_logs (
     sent_at                  TIMESTAMPTZ DEFAULT NOW(),
     metadata                 JSONB
 );
+
+-- Defensive (same reason as above): patch any partial previous schema.
+ALTER TABLE recruitment_whatsapp_logs
+    ADD COLUMN IF NOT EXISTS candidate_id             UUID,
+    ADD COLUMN IF NOT EXISTS template_id              UUID,
+    ADD COLUMN IF NOT EXISTS ab_variant               TEXT,
+    ADD COLUMN IF NOT EXISTS body                     TEXT,
+    ADD COLUMN IF NOT EXISTS to_phone                 TEXT,
+    ADD COLUMN IF NOT EXISTS chatwoot_contact_id      BIGINT,
+    ADD COLUMN IF NOT EXISTS chatwoot_conversation_id BIGINT,
+    ADD COLUMN IF NOT EXISTS chatwoot_message_id      BIGINT,
+    ADD COLUMN IF NOT EXISTS status                   TEXT NOT NULL DEFAULT 'queued',
+    ADD COLUMN IF NOT EXISTS sent_at                  TIMESTAMPTZ DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS metadata                 JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_whatsapp_logs_candidate
     ON recruitment_whatsapp_logs(candidate_id);
