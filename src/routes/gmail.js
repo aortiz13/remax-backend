@@ -223,29 +223,64 @@ router.post('/send', authMiddleware, async (req, res) => {
                 job.waitUntilFinished(emailQueueEvents, SEND_TIMEOUT_MS),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT')), SEND_TIMEOUT_MS + 1000)),
             ]);
-            console.log(`✅ [Gmail Send] Email confirmed sent, Gmail ID: ${result?.id || 'unknown'}`);
+
+            // Defensive: BullMQ resolves successfully when the job returns ANY value
+            // (even undefined). We must require an actual Gmail message id before
+            // telling the frontend the email was sent — otherwise the caller (e.g.
+            // InspectionFormPage.confirmSend) will mark the entity as 'sent' on a
+            // false positive, which is exactly what happened on 2026-05-13.
+            if (!result?.id) {
+                console.error('[Gmail Send] Worker returned without a Gmail message id', { jobId: job.id, result });
+                await logAudit({
+                    level: 'error', action: 'gmail.send.no_message_id',
+                    message: `Worker completó sin gmail_message_id al enviar a ${emailData.to}`,
+                    user_id: agentId, user_email: userEmail,
+                    details: { to: emailData.to, subject: emailData.subject, job_id: job.id, result: result ? JSON.stringify(result).substring(0, 300) : null },
+                });
+                logErrorToSlack('error', {
+                    category: 'backend', action: 'gmail.send.no_message_id',
+                    message: `Email send returned no message id (silent failure path)`,
+                    module: 'gmail', user_email: userEmail,
+                    details: { to: emailData.to, subject: emailData.subject, job_id: job.id },
+                });
+                return res.status(500).json({ error: 'El servicio confirmó el envío pero Gmail no devolvió un identificador. El correo NO se envió. Reintenta o avisa al equipo técnico.' });
+            }
+
+            console.log(`✅ [Gmail Send] Email confirmed sent, Gmail ID: ${result.id}`);
 
             // Log: success
             await logAudit({
                 level: 'info', action: 'gmail.send.success',
                 message: `Correo enviado exitosamente a ${emailData.to}`,
                 user_id: agentId, user_email: userEmail,
-                details: { to: emailData.to, subject: emailData.subject, gmail_message_id: result?.id, job_id: job.id },
+                details: { to: emailData.to, subject: emailData.subject, gmail_message_id: result.id, job_id: job.id },
             });
 
-            res.json({ success: true, message: 'Correo enviado exitosamente', gmailMessageId: result?.id });
+            res.json({ success: true, message: 'Correo enviado exitosamente', gmailMessageId: result.id });
         } catch (waitErr) {
             if (waitErr.message === 'TIMEOUT') {
                 console.warn('[Gmail Send] Job timed out after 30s, checking state...');
                 const state = await job.getState();
                 if (state === 'completed') {
+                    // Same defense as above: only report success if the worker's
+                    // return value actually contains a Gmail message id.
+                    const slowResult = await job.returnvalue;
+                    if (!slowResult?.id) {
+                        await logAudit({
+                            level: 'error', action: 'gmail.send.slow_no_message_id',
+                            message: `Job completó tras timeout pero sin gmail_message_id (${emailData.to})`,
+                            user_id: agentId, user_email: userEmail,
+                            details: { to: emailData.to, subject: emailData.subject, job_id: job.id },
+                        });
+                        return res.status(500).json({ error: 'El envío demoró y no se pudo confirmar entrega. Reintenta.' });
+                    }
                     await logAudit({
                         level: 'warning', action: 'gmail.send.slow_success',
                         message: `Correo a ${emailData.to} enviado con delay (timeout pero completado)`,
                         user_id: agentId, user_email: userEmail,
-                        details: { to: emailData.to, subject: emailData.subject, job_id: job.id },
+                        details: { to: emailData.to, subject: emailData.subject, gmail_message_id: slowResult.id, job_id: job.id },
                     });
-                    res.json({ success: true, message: 'Correo enviado exitosamente' });
+                    res.json({ success: true, message: 'Correo enviado exitosamente', gmailMessageId: slowResult.id });
                 } else {
                     await logAudit({
                         level: 'error', action: 'gmail.send.timeout',
