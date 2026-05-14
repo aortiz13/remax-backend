@@ -15,6 +15,10 @@ const GMAIL_SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
     'https://www.googleapis.com/auth/gmail.modify',
+    // Calendar scopes — granted in the same OAuth consent so connecting
+    // emprendedores@ also enables bidirectional Google Calendar sync.
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/calendar.events',
 ].join(' ');
 
 // Generate Gmail OAuth URL (supports both GET and POST)
@@ -398,13 +402,14 @@ router.post('/connect-recruitment', authMiddleware, async (req, res) => {
 
         // Save as recruitment account
         await pool.query(`
-            INSERT INTO gmail_accounts (agent_id, email_address, access_token, refresh_token, purpose, updated_at)
-            VALUES ($1, $2, $3, $4, 'recruitment', NOW())
+            INSERT INTO gmail_accounts (agent_id, email_address, access_token, refresh_token, purpose, calendar_id, updated_at)
+            VALUES ($1, $2, $3, $4, 'recruitment', 'primary', NOW())
             ON CONFLICT (email_address)
             DO UPDATE SET
                 access_token = EXCLUDED.access_token,
                 refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_accounts.refresh_token),
                 purpose = 'recruitment',
+                calendar_id = COALESCE(gmail_accounts.calendar_id, 'primary'),
                 updated_at = NOW()
         `, [req.user.id, gmailProfile.emailAddress, tokens.access_token, tokens.refresh_token]);
 
@@ -421,7 +426,22 @@ router.post('/connect-recruitment', authMiddleware, async (req, res) => {
             }),
         });
 
-        res.json({ success: true, email: gmailProfile.emailAddress });
+        // Setup Google Calendar watch + initial sync.
+        // Best-effort: failures here don't block the Gmail connection.
+        let calendarReady = false;
+        try {
+            const { setupRecruitmentCalendarWatch, syncRecruitmentCalendar } = await import('./recruitmentCalendar.js');
+            await setupRecruitmentCalendarWatch(gmailProfile.emailAddress, tokens.access_token);
+            await syncRecruitmentCalendar(gmailProfile.emailAddress, tokens.access_token, { fullSync: true });
+            calendarReady = true;
+        } catch (calErr) {
+            logErrorToSlack('warn', {
+                category: 'backend', action: 'gmail.connect_recruitment.calendar_setup',
+                message: calErr.message, module: 'gmail',
+            });
+        }
+
+        res.json({ success: true, email: gmailProfile.emailAddress, calendarReady });
     } catch (error) {
         logErrorToSlack('error', {
             category: 'backend', action: 'gmail.connect_recruitment', message: error.message,

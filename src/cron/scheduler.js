@@ -1,5 +1,5 @@
 import cron from 'node-cron';
-import { calendarQueue, importQueue, youtubeQueue, cameraReminderQueue, cleanupQueue, recruitmentQueue, taskReminderQueue } from '../queues/index.js';
+import { calendarQueue, calendarWebhookQueue, importQueue, youtubeQueue, cameraReminderQueue, cleanupQueue, recruitmentQueue, taskReminderQueue } from '../queues/index.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import pool from '../lib/db.js';
@@ -20,6 +20,39 @@ export function startCronJobs() {
                 agentId: profile.id,
                 action: 'sync_from_google',
             }, { jobId: `cal-sync-${profile.id}-${Date.now()}` });
+        }
+    });
+
+    // Recruitment Calendar — sync emprendedores@ every 15 minutes (fallback if watch missed an event)
+    cron.schedule('*/15 * * * *', async () => {
+        try {
+            const { rows } = await pool.query(
+                `SELECT email_address FROM gmail_accounts WHERE purpose = 'recruitment' LIMIT 1`
+            );
+            if (rows.length === 0) return;
+            await calendarWebhookQueue.add('recruitment-calendar-sync', {
+                kind: 'recruitment', emailAddress: rows[0].email_address,
+            }, { jobId: `rec-cal-cron-${Date.now()}` });
+        } catch (err) {
+            logErrorToSlack('error', { category: 'cron', action: 'recruitment_calendar.sync', message: err.message, module: 'scheduler' });
+        }
+    });
+
+    // Recruitment Calendar — renew watch daily at 4am (watches expire ~7 days)
+    cron.schedule('0 4 * * *', async () => {
+        try {
+            const { rows } = await pool.query(`
+                SELECT email_address FROM gmail_accounts
+                WHERE purpose = 'recruitment'
+                  AND (calendar_watch_expiration IS NULL OR calendar_watch_expiration < NOW() + INTERVAL '2 days')
+            `);
+            for (const account of rows) {
+                await calendarWebhookQueue.add('recruitment-calendar-renew', {
+                    kind: 'recruitment', action: 'renew-watch', emailAddress: account.email_address,
+                }, { jobId: `rec-cal-renew-${account.email_address}-${Date.now()}` });
+            }
+        } catch (err) {
+            logErrorToSlack('error', { category: 'cron', action: 'recruitment_calendar.watch_renew', message: err.message, module: 'scheduler' });
         }
     });
 

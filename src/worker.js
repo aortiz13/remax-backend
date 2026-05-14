@@ -915,6 +915,29 @@ new Worker('task-reminder', async (job) => {
     }
 }, { connection: redisConnection, concurrency: 3 });
 
+// ─── Recruitment Calendar Sync Worker ──────────────────────────────────
+new Worker('calendar-webhook', async (job) => {
+    if (job.data?.kind !== 'recruitment') return;
+    try {
+        const { syncRecruitmentCalendar, setupRecruitmentCalendarWatch } = await import('./routes/recruitmentCalendar.js');
+        if (job.data.action === 'renew-watch') {
+            await setupRecruitmentCalendarWatch(job.data.emailAddress);
+            console.log(`📅 Recruitment calendar watch renewed for ${job.data.emailAddress}`);
+            return;
+        }
+        const result = await syncRecruitmentCalendar(job.data.emailAddress);
+        console.log(`📅 Recruitment calendar sync: ${JSON.stringify(result)}`);
+    } catch (err) {
+        console.error(`❌ Recruitment calendar worker error: ${err.message}`);
+        const { logErrorToSlack } = await import('./middleware/slackErrorLogger.js');
+        logErrorToSlack('error', {
+            category: 'worker', action: 'recruitment_calendar.sync', message: err.message,
+            module: 'worker',
+        });
+        throw err;
+    }
+}, { connection: redisConnection, concurrency: 1 });
+
 // Start cron jobs
 startCronJobs();
 

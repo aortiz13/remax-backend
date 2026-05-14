@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
-import { gmailWebhookQueue, calendarQueue } from '../queues/index.js';
+import pool from '../lib/db.js';
+import { gmailWebhookQueue, calendarQueue, calendarWebhookQueue } from '../queues/index.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
 const router = Router();
@@ -88,6 +89,50 @@ router.post('/calendar', async (req, res) => {
     } catch (error) {
         logErrorToSlack('error', {
             category: 'backend', action: 'webhook.calendar', message: error.message,
+            module: 'webhooks',
+        });
+        res.status(200).send('ok');
+    }
+});
+
+// POST /api/webhooks/recruitment-calendar — Push notifications for emprendedores@'s Calendar
+router.post('/recruitment-calendar', async (req, res) => {
+    try {
+        const channelId = req.headers['x-goog-channel-id'];
+        const resourceState = req.headers['x-goog-resource-state'];
+
+        // Always respond 200 quickly — Google retries on non-2xx
+        if (resourceState === 'sync') {
+            return res.status(200).send('sync ack');
+        }
+
+        // Identify which gmail_account this channel belongs to
+        if (!channelId) return res.status(200).send('ok');
+
+        const { rows } = await pool.query(
+            `SELECT email_address FROM gmail_accounts
+             WHERE calendar_watch_channel_id = $1 AND purpose = 'recruitment'
+             LIMIT 1`,
+            [channelId]
+        );
+        if (rows.length === 0) {
+            // Stale channel — no-op
+            return res.status(200).send('ok');
+        }
+
+        await calendarWebhookQueue.add('recruitment-calendar-sync', {
+            kind: 'recruitment',
+            emailAddress: rows[0].email_address,
+        }, {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 2000 },
+            jobId: `recruitment-cal-${channelId}-${Date.now()}`,
+        });
+
+        res.status(200).send('ok');
+    } catch (error) {
+        logErrorToSlack('error', {
+            category: 'backend', action: 'webhook.recruitment_calendar', message: error.message,
             module: 'webhooks',
         });
         res.status(200).send('ok');
