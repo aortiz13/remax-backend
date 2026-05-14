@@ -377,6 +377,94 @@ new Worker('recruitment-email', async (job) => {
     }
 }, { connection: redisConnection, concurrency: 3 });
 
+// =============================================
+// 💬 RECRUITMENT WHATSAPP WORKER — sends via Chatwoot
+// Listens on 'recruitment-whatsapp'. Each job:
+//   1. find-or-create the Chatwoot contact (by phone, cached on the
+//      candidate row)
+//   2. find-or-create the WhatsApp conversation
+//   3. POST the message
+//   4. mark recruitment_whatsapp_logs row as 'sent' (or 'failed')
+// =============================================
+new Worker('recruitment-whatsapp', async (job) => {
+    const { logId, candidateId, content } = job.data;
+    console.log(`💬 [Recruitment WA] Sending log=${logId} candidate=${candidateId}...`);
+
+    try {
+        const { sendWhatsappToCandidate } = await import('./services/chatwootService.js');
+
+        const { rows } = await pool.query(
+            `SELECT id, first_name, last_name, email, phone, whatsapp
+               FROM recruitment_candidates WHERE id = $1`,
+            [candidateId],
+        );
+        const candidate = rows[0];
+        if (!candidate) throw new Error(`Candidate ${candidateId} not found`);
+
+        const result = await sendWhatsappToCandidate({ candidate, content });
+
+        await pool.query(
+            `UPDATE recruitment_whatsapp_logs
+                SET status                   = 'sent',
+                    chatwoot_contact_id      = $1,
+                    chatwoot_conversation_id = $2,
+                    chatwoot_message_id      = $3,
+                    sent_at                  = NOW()
+              WHERE id = $4`,
+            [result.chatwoot_contact_id, result.chatwoot_conversation_id, result.chatwoot_message_id, logId],
+        );
+
+        // Timeline / activity_logs entry — the CLAUDE.md mandates it for every
+        // lead/candidate action so the storyline shows the WhatsApp.
+        try {
+            await pool.query(
+                `INSERT INTO activity_logs (id, actor_id, action, entity_type, entity_id, description, details)
+                 VALUES (gen_random_uuid(), NULL, 'WhatsApp Enviado', 'Candidate', $1, $2, $3)`,
+                [
+                    candidateId,
+                    `WhatsApp enviado a ${candidate.whatsapp || candidate.phone || candidate.email || ''}`.trim(),
+                    JSON.stringify({
+                        log_id: logId,
+                        chatwoot_contact_id: result.chatwoot_contact_id,
+                        chatwoot_conversation_id: result.chatwoot_conversation_id,
+                        chatwoot_message_id: result.chatwoot_message_id,
+                        preview: String(content || '').slice(0, 200),
+                    }),
+                ],
+            );
+        } catch (logErr) {
+            console.error('[Recruitment WA] activity_logs insert failed:', logErr.message);
+        }
+
+        console.log(`✅ [Recruitment WA] log=${logId} sent`);
+    } catch (err) {
+        console.error(`❌ [Recruitment WA] Job ${job.id} failed:`, err);
+        try {
+            await pool.query(
+                `UPDATE recruitment_whatsapp_logs
+                    SET status   = 'failed',
+                        metadata = COALESCE(metadata, '{}'::jsonb)
+                                   || jsonb_build_object('error', $1::text)
+                  WHERE id = $2`,
+                [String(err?.message || err).slice(0, 1000), logId],
+            );
+        } catch (logErr) {
+            console.error('[Recruitment WA] Failed to mark log failed:', logErr.message);
+        }
+        try {
+            const { logErrorToSlack } = await import('./middleware/slackErrorLogger.js');
+            logErrorToSlack('error', {
+                category: 'recruitment',
+                action: 'recruitment_whatsapp.send_error',
+                message: `❌ Falló envío de WhatsApp (candidate ${candidateId}): ${err?.message || err}`,
+                module: 'recruitment-whatsapp-worker',
+                details: { logId, candidateId, jobId: job.id, stack: (err?.stack || '').toString().slice(0, 800) },
+            });
+        } catch {}
+        throw err;
+    }
+}, { connection: redisConnection, concurrency: 3 });
+
 async function runRecruitmentEmailJob({ accountEmail, to, subject, bodyHtml: bodyHtmlIn, candidateId, attachments, jobId }) {
     let bodyHtml = bodyHtmlIn;
     const breadcrumb = (step) => console.log(`   [Recruitment ${jobId}] ${step}`);

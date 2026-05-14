@@ -1,9 +1,10 @@
 import express from 'express';
 import pool from '../lib/db.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
-import { recruitmentEmailQueue } from '../queues/index.js';
+import { recruitmentEmailQueue, recruitmentWhatsappQueue } from '../queues/index.js';
 import { uploadFile } from '../lib/storage.js';
 import { resolveCalendarEventVars } from '../lib/calendarVariables.js';
+import { isChatwootConfigured } from '../services/chatwootService.js';
 import Busboy from 'busboy';
 import crypto from 'crypto';
 
@@ -616,9 +617,71 @@ async function executeTaskRule(rule, candidate) {
     `, [candidate.id, title, rule.task_type || 'Seguimiento']);
 }
 
+// ============================================================
+// WhatsApp rule — sends a message via Chatwoot (in parallel to any
+// email rule that may exist for the same stage). Picks an A/B variant
+// when ab_enabled, renders {{nombre}}/{{evento:...}}, then enqueues to
+// the recruitment-whatsapp BullMQ queue (the worker calls Chatwoot).
+// ============================================================
+async function executeWhatsappRule(rule, candidate) {
+    const phone = candidate.whatsapp || candidate.phone;
+    if (!phone) throw new Error('Candidate has no whatsapp/phone');
+    if (!isChatwootConfigured()) {
+        throw new Error('Chatwoot env vars missing (CHATWOOT_API_URL / TOKEN / ACCOUNT_ID / INBOX_ID)');
+    }
+
+    let templateId = rule.whatsapp_template_id;
+    let abVariant = null;
+    if (rule.ab_enabled && rule.ab_whatsapp_template_b_id) {
+        const useB = Math.random() < 0.5;
+        templateId = useB ? rule.ab_whatsapp_template_b_id : rule.whatsapp_template_id;
+        abVariant = useB ? 'B' : 'A';
+    }
+    if (!templateId) throw new Error(`Rule ${rule.id} has no whatsapp_template_id`);
+
+    const { rows: tplRows } = await pool.query(
+        `SELECT id, body FROM recruitment_whatsapp_templates WHERE id = $1`,
+        [templateId],
+    );
+    if (!tplRows.length) throw new Error(`WhatsApp template ${templateId} not found`);
+    const tpl = tplRows[0];
+
+    const vars = buildTemplateVars(candidate);
+    let body = renderTemplateVars(tpl.body, vars);
+    body = await resolveCalendarEventVars(body);
+
+    // Persist the log row first so we have an id to update from the worker.
+    const { rows: logRows } = await pool.query(
+        `INSERT INTO recruitment_whatsapp_logs
+            (candidate_id, template_id, ab_variant, body, to_phone, status, metadata)
+         VALUES ($1, $2, $3, $4, $5, 'queued', $6)
+         RETURNING id`,
+        [
+            candidate.id,
+            templateId,
+            abVariant,
+            body,
+            phone,
+            JSON.stringify({ rule_id: rule.id, trigger: 'automation_rule' }),
+        ],
+    );
+    const logId = logRows[0].id;
+
+    await recruitmentWhatsappQueue.add(
+        'send-recruitment-whatsapp',
+        { logId, candidateId: candidate.id, content: body },
+        {
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 5000 },
+            delay: (rule.delay_minutes || 0) * 60 * 1000,
+        },
+    );
+}
+
 async function executeRulesForStage(candidate, stage) {
     const { rows: rules } = await pool.query(
         `SELECT id, action_type, template_id, ab_enabled, ab_template_b_id,
+                whatsapp_template_id, ab_whatsapp_template_b_id,
                 task_title, task_type, delay_minutes, attachments_json
            FROM recruitment_automation_rules
           WHERE trigger_stage = $1 AND is_active = true`,
@@ -633,6 +696,8 @@ async function executeRulesForStage(candidate, stage) {
         try {
             if (rule.action_type === 'send_email') {
                 await executeEmailRule(rule, candidate);
+            } else if (rule.action_type === 'send_whatsapp') {
+                await executeWhatsappRule(rule, candidate);
             } else if (rule.action_type === 'create_task') {
                 await executeTaskRule(rule, candidate);
             } else {
@@ -880,6 +945,148 @@ router.post('/templates/ai-generate', async (req, res) => {
             module: 'leads-ai',
         });
         res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// WhatsApp templates CRUD  (/api/recruitment/whatsapp-templates)
+// Mirrors the email templates endpoints but with a plain-text body
+// instead of HTML. Body may contain {{nombre}}, {{evento:...}}, etc.
+// ============================================================
+router.get('/whatsapp-templates', async (_req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT id, name, body, category, is_default, created_by, created_at, updated_at
+               FROM recruitment_whatsapp_templates
+              ORDER BY is_default DESC NULLS LAST, name ASC`,
+        );
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.get('/whatsapp-templates/:id', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT id, name, body, category, is_default, created_by, created_at, updated_at
+               FROM recruitment_whatsapp_templates WHERE id = $1`,
+            [req.params.id],
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Not found' });
+        res.json(rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.post('/whatsapp-templates', async (req, res) => {
+    try {
+        const { name, body, category, is_default, created_by } = req.body || {};
+        if (!name || !body) return res.status(400).json({ error: 'name and body are required' });
+        const { rows } = await pool.query(
+            `INSERT INTO recruitment_whatsapp_templates (name, body, category, is_default, created_by)
+             VALUES ($1, $2, COALESCE($3, 'General'), COALESCE($4, false), $5)
+             RETURNING *`,
+            [name, body, category || null, is_default || false, created_by || null],
+        );
+        res.json(rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.put('/whatsapp-templates/:id', async (req, res) => {
+    try {
+        const { name, body, category, is_default } = req.body || {};
+        const { rows } = await pool.query(
+            `UPDATE recruitment_whatsapp_templates
+                SET name       = COALESCE($1, name),
+                    body       = COALESCE($2, body),
+                    category   = COALESCE($3, category),
+                    is_default = COALESCE($4, is_default),
+                    updated_at = NOW()
+              WHERE id = $5
+              RETURNING *`,
+            [name ?? null, body ?? null, category ?? null, is_default ?? null, req.params.id],
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Not found' });
+        res.json(rows[0]);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+router.delete('/whatsapp-templates/:id', async (req, res) => {
+    try {
+        await pool.query(`DELETE FROM recruitment_whatsapp_templates WHERE id = $1`, [req.params.id]);
+        res.json({ ok: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ============================================================
+// Send a WhatsApp manually to a candidate (ad-hoc, not from a rule).
+// Body: { templateId?: string, content?: string }
+// Either templateId (renders from a stored template) or content (raw
+// text) is required.
+// ============================================================
+router.post('/candidates/:id/send-whatsapp', async (req, res) => {
+    try {
+        const { templateId, content } = req.body || {};
+        if (!templateId && !content) {
+            return res.status(400).json({ error: 'templateId or content is required' });
+        }
+
+        const { rows: candRows } = await pool.query(
+            `SELECT id, first_name, last_name, email, phone, whatsapp, city
+               FROM recruitment_candidates WHERE id = $1`,
+            [req.params.id],
+        );
+        if (!candRows.length) return res.status(404).json({ error: 'Candidate not found' });
+        const candidate = candRows[0];
+
+        let body = content;
+        if (templateId) {
+            const { rows: tplRows } = await pool.query(
+                `SELECT body FROM recruitment_whatsapp_templates WHERE id = $1`,
+                [templateId],
+            );
+            if (!tplRows.length) return res.status(404).json({ error: 'Template not found' });
+            body = tplRows[0].body;
+        }
+
+        const vars = buildTemplateVars(candidate);
+        body = renderTemplateVars(body, vars);
+        body = await resolveCalendarEventVars(body);
+
+        const { rows: logRows } = await pool.query(
+            `INSERT INTO recruitment_whatsapp_logs
+                (candidate_id, template_id, body, to_phone, status, metadata)
+             VALUES ($1, $2, $3, $4, 'queued', $5)
+             RETURNING id`,
+            [
+                candidate.id,
+                templateId || null,
+                body,
+                candidate.whatsapp || candidate.phone,
+                JSON.stringify({ trigger: 'manual', actor: req.headers['x-user-id'] || null }),
+            ],
+        );
+        await recruitmentWhatsappQueue.add(
+            'send-recruitment-whatsapp',
+            { logId: logRows[0].id, candidateId: candidate.id, content: body },
+            { attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
+        );
+
+        res.json({ ok: true, logId: logRows[0].id });
+    } catch (err) {
+        logErrorToSlack('error', {
+            category: 'recruitment', action: 'whatsapp.manual_send_error',
+            message: err.message, module: 'leads-whatsapp',
+        });
+        res.status(500).json({ error: err.message });
     }
 });
 
