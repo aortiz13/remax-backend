@@ -40,10 +40,10 @@ export function formatEventDateEs(date, { tz = DEFAULT_TZ, mode = 'fecha_y_hora'
         case 'fecha_larga':
             return `${dia} de ${mes} de ${anio}`;
         case 'hora':
-            return `${hora}:${minutos}`;
+            return `${hora}:${minutos} hs`;
         case 'fecha_y_hora':
         default:
-            return `${dia} de ${mes} a las ${hora}:${minutos}`;
+            return `${dia} de ${mes} a las ${hora}:${minutos} hs`;
     }
 }
 
