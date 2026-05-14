@@ -15,7 +15,7 @@ const API_BASE = process.env.PUBLIC_API_BASE_URL
 
 async function getRecruitmentAccount() {
     const { rows } = await pool.query(`
-        SELECT id, email_address, access_token, refresh_token,
+        SELECT id, agent_id, email_address, access_token, refresh_token,
                calendar_id, calendar_sync_token,
                calendar_watch_channel_id, calendar_watch_resource_id, calendar_watch_expiration
         FROM gmail_accounts
@@ -180,6 +180,17 @@ export async function pushTaskToGoogle(taskId, action, actorId) {
         });
     }
 
+    if (response.status === 403) {
+        // OAuth lacks calendar scope — disable sync state silently
+        await pool.query(
+            `UPDATE gmail_accounts
+             SET calendar_watch_channel_id = NULL, calendar_watch_resource_id = NULL,
+                 calendar_watch_expiration = NULL, calendar_sync_token = NULL
+             WHERE id = $1`,
+            [account.id]
+        );
+        return { success: false, skipped: 'insufficient_scope' };
+    }
     if (!response.ok) {
         const errBody = await response.text();
         throw new Error(`Google Calendar upsert failed: ${response.status} ${errBody}`);
@@ -254,6 +265,20 @@ export async function syncRecruitmentCalendar(emailAddress, accessTokenOverride,
             attempt += 1;
             if (attempt > 1) throw new Error('Calendar sync looping on 410');
             continue;
+        }
+        if (resp.status === 403) {
+            // Token doesn't have calendar scopes — disable sync until the
+            // mailbox is reconnected with the new OAuth scopes.
+            await pool.query(
+                `UPDATE gmail_accounts
+                 SET calendar_watch_channel_id = NULL,
+                     calendar_watch_resource_id = NULL,
+                     calendar_watch_expiration = NULL,
+                     calendar_sync_token = NULL
+                 WHERE id = $1`,
+                [account.id]
+            );
+            return { processed: 0, created: 0, updated: 0, deleted: 0, skipped: 'insufficient_scope' };
         }
         if (!resp.ok) {
             const body = await resp.text();
@@ -355,11 +380,11 @@ export async function syncRecruitmentCalendar(emailAddress, accessTokenOverride,
             INSERT INTO recruitment_tasks (
                 id, title, description, location,
                 execution_date, end_date, task_type, priority,
-                candidate_id, google_event_id, google_etag,
+                candidate_id, assigned_to, google_event_id, google_etag,
                 is_external, last_google_sync_at, created_at, updated_at
             ) VALUES (
                 gen_random_uuid(), $1, $2, $3, $4, $5, 'Reunión', 'media',
-                $6, $7, $8, TRUE, NOW(), NOW(), NOW()
+                $6, $7, $8, $9, TRUE, NOW(), NOW(), NOW()
             ) RETURNING id
         `, [
             ev.summary || 'Sin título',
@@ -368,6 +393,7 @@ export async function syncRecruitmentCalendar(emailAddress, accessTokenOverride,
             startISO,
             endISO,
             candidateId,
+            account.agent_id,
             ev.id,
             ev.etag,
         ]);
@@ -431,6 +457,9 @@ export async function setupRecruitmentCalendarWatch(emailAddress, accessTokenOve
         }),
     });
 
+    if (watchResp.status === 403) {
+        return { skipped: 'insufficient_scope' };
+    }
     if (!watchResp.ok) {
         const body = await watchResp.text();
         throw new Error(`Calendar watch failed: ${watchResp.status} ${body}`);
