@@ -909,7 +909,7 @@ async function processPostularForm(data) {
                 $1, $2, $3, $4, $5,
                 $6, $7, $8,
                 $9, $10, $11,
-                'Web - Postulación', 'nuevo_lead', NOW()
+                'Web - Aprobación', 'nuevo_lead', NOW()
             ) RETURNING id, first_name, last_name, email
         `, [firstName, lastName, email, phone, rut,
             birthDate, maritalStatus, address,
@@ -921,8 +921,8 @@ async function processPostularForm(data) {
         category: 'web-forms',
         action: isUpdate ? 'postular.updated' : 'postular.created',
         message: isUpdate
-            ? `📝 Postulación completada: ${firstName} ${lastName} (${email || 'sin email'}) → candidato ${row.id}`
-            : `🆕 Nueva postulación web: ${firstName} ${lastName} (${email || 'sin email'})`,
+            ? `📝 Formulario de aprobación completado: ${firstName} ${lastName} (${email || 'sin email'}) → candidato ${row.id}`
+            : `🆕 Nuevo formulario de aprobación: ${firstName} ${lastName} (${email || 'sin email'})`,
         module: 'web-forms',
         details: { candidateId: row.id, email, phone, rut },
     });
