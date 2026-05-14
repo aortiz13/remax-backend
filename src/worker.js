@@ -146,6 +146,21 @@ new Worker('email', async (job) => {
     }
 
     const result = await response.json();
+
+    // Defensive: a real Gmail send ALWAYS returns a message id. If we got 200 with
+    // no id (corrupted body, intermediate proxy, etc.) we must NOT silently report
+    // success — that's the false-positive path that marked Karina's inspection
+    // as 'sent' on 2026-05-13 without any email actually leaving.
+    if (!result?.id) {
+        await logWorkerAudit({
+            level: 'error', action: 'worker.email.no_message_id',
+            message: `Gmail respondió 200 sin message id al enviar a ${to}`,
+            user_id: agentId, user_email: account.email_address,
+            details: { to, subject, from: account.email_address, response_body: JSON.stringify(result)?.substring(0, 500), job_id: job.id },
+        });
+        throw new Error(`Gmail returned 200 with no message id (body: ${JSON.stringify(result)?.substring(0, 200)})`);
+    }
+
     console.log(`✅ [Worker] Email sent: ${result.id} (from: ${account.email_address} → to: ${to})`);
 
     // Log: successful delivery by worker
