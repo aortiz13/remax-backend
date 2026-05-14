@@ -1,7 +1,7 @@
 import express from 'express';
 import pool from '../lib/db.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
-import { emailQueue } from '../queues/index.js';
+import { recruitmentEmailQueue } from '../queues/index.js';
 
 const router = express.Router();
 
@@ -535,8 +535,9 @@ router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
             }]
             : [];
 
-        // Enqueue email send
-        await emailQueue.add('send-recruitment-email', {
+        // Enqueue email send on the dedicated recruitment-email queue so the
+        // generic per-agent email worker doesn't accidentally claim the job.
+        await recruitmentEmailQueue.add('send-recruitment-email', {
             accountEmail,
             to: candidate.email,
             subject,

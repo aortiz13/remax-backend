@@ -51,11 +51,6 @@ async function getAccessToken(refreshToken, accountTable, emailField, emailValue
 // 📧 EMAIL WORKER — sends emails via Gmail API
 // =============================================
 new Worker('email', async (job) => {
-    // Recruitment emails (emprendedores@) are handled by the dedicated worker
-    // a few blocks below. Skip them here so this worker doesn't try to look up
-    // an agent_id that doesn't exist in the recruitment job payload.
-    if (job.name === 'send-recruitment-email') return;
-
     const { agentId, to, subject, body, bodyHtml, cc, bcc, inReplyTo, threadId, attachments } = job.data;
     // Support both 'body' and 'bodyHtml' field names (frontend sends 'bodyHtml')
     let htmlBody = bodyHtml || body;
@@ -166,10 +161,10 @@ new Worker('email', async (job) => {
 
 // =============================================
 // 📧 RECRUITMENT EMAIL WORKER — sends via emprendedores@ account
+// Listens on a dedicated queue ('recruitment-email') so the generic
+// email worker above doesn't accidentally pick up our jobs.
 // =============================================
-new Worker('email', async (job) => {
-    if (job.name !== 'send-recruitment-email') return;
-
+new Worker('recruitment-email', async (job) => {
     const { accountEmail, to, subject, bodyHtml: bodyHtmlOrig, candidateId, attachments } = job.data;
     let bodyHtml = bodyHtmlOrig;
     console.log(`📧 [Recruitment] Sending email to ${to} via ${accountEmail}...`);
