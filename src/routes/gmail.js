@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import authMiddleware from '../middleware/auth.js';
 import pool from '../lib/db.js';
-import { emailQueue, emailQueueEvents } from '../queues/index.js';
+import { emailQueue, emailQueueEvents, recruitmentEmailQueue } from '../queues/index.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 
@@ -309,8 +309,9 @@ router.post('/send-recruitment', authMiddleware, async (req, res) => {
 
         const recruitmentAccount = result.rows[0];
 
-        // Queue email for sending
-        await emailQueue.add('send-recruitment-email', {
+        // Queue email for sending — uses the dedicated recruitment-email queue
+        // so it doesn't compete with the per-agent email worker.
+        await recruitmentEmailQueue.add('send-recruitment-email', {
             accountEmail: recruitmentAccount.email_address,
             to: toEmail,
             subject,
