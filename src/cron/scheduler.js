@@ -24,11 +24,15 @@ export function startCronJobs() {
     });
 
     // Recruitment Calendar — sync emprendedores@ every 15 minutes (fallback if watch missed an event)
+    // Skip if the watch isn't active (account hasn't been reconnected with calendar scopes yet)
     cron.schedule('*/15 * * * *', async () => {
         try {
-            const { rows } = await pool.query(
-                `SELECT email_address FROM gmail_accounts WHERE purpose = 'recruitment' LIMIT 1`
-            );
+            const { rows } = await pool.query(`
+                SELECT email_address FROM gmail_accounts
+                WHERE purpose = 'recruitment'
+                  AND calendar_watch_channel_id IS NOT NULL
+                LIMIT 1
+            `);
             if (rows.length === 0) return;
             await calendarWebhookQueue.add('recruitment-calendar-sync', {
                 kind: 'recruitment', emailAddress: rows[0].email_address,
