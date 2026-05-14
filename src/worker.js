@@ -170,15 +170,56 @@ new Worker('email', async (job) => {
 new Worker('email', async (job) => {
     if (job.name !== 'send-recruitment-email') return;
 
-    const { accountEmail, to, subject, bodyHtml, candidateId, attachments } = job.data;
+    const { accountEmail, to, subject, bodyHtml: bodyHtmlOrig, candidateId, attachments } = job.data;
+    let bodyHtml = bodyHtmlOrig;
     console.log(`📧 [Recruitment] Sending email to ${to} via ${accountEmail}...`);
 
-    const { data: account } = await supabaseAdmin
+    try {
+        await runRecruitmentEmailJob({ accountEmail, to, subject, bodyHtml, candidateId, attachments, jobId: job.id });
+    } catch (err) {
+        console.error(`❌ [Recruitment] Job ${job.id} failed:`, err);
+        // Mark the queued log row as failed so we can see the cause in the DB
+        try {
+            await pool.query(
+                `UPDATE recruitment_email_logs
+                    SET status = 'failed',
+                        metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('error', $1::text)
+                  WHERE candidate_id = $2 AND status = 'queued'`,
+                [String(err?.message || err).slice(0, 1000), candidateId],
+            );
+        } catch (logErr) {
+            console.error('[Recruitment] Failed to UPDATE recruitment_email_logs to failed:', logErr.message);
+        }
+        // Slack alert with the real reason
+        try {
+            const { logErrorToSlack } = await import('./middleware/slackErrorLogger.js');
+            logErrorToSlack('error', {
+                category: 'recruitment',
+                action: 'recruitment_email.send_error',
+                message: `❌ Falló envío del email de Aprobación/Rechazo a ${to}: ${err?.message || err}`,
+                module: 'recruitment-worker',
+                details: {
+                    candidateId, accountEmail, to, subject, jobId: job.id,
+                    stack: (err?.stack || '').toString().slice(0, 800),
+                },
+            });
+        } catch (slackErr) {
+            console.error('[Recruitment] Slack alert also failed:', slackErr.message);
+        }
+        throw err; // let BullMQ retry
+    }
+}, { connection: redisConnection, concurrency: 3 });
+
+async function runRecruitmentEmailJob({ accountEmail, to, subject, bodyHtml: bodyHtmlIn, candidateId, attachments, jobId }) {
+    let bodyHtml = bodyHtmlIn;
+
+    const { data: account, error: accountErr } = await supabaseAdmin
         .from('gmail_accounts')
         .select('*')
         .eq('email_address', accountEmail)
         .single();
 
+    if (accountErr) throw new Error(`supabaseAdmin gmail_accounts query failed: ${accountErr.message}`);
     if (!account) throw new Error(`No recruitment Gmail account found: ${accountEmail}`);
 
     let accessToken = account.access_token;
@@ -263,7 +304,7 @@ new Worker('email', async (job) => {
     const result = await response.json();
     console.log(`✅ [Recruitment] Email sent: ${result.id}`);
     return result;
-}, { connection: redisConnection, concurrency: 3 });
+}
 
 async function sendGmail(accessToken, email, raw, threadId) {
     const body = { raw };
