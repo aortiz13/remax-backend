@@ -292,7 +292,7 @@ async function createCandidate(data, source) {
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8,
             $9, $10, $11, $12,
-            $13, 'Nuevo',
+            $13, 'nuevo_lead',
             $14, $15, $16,
             $17, $18, $19,
             $20, $21, $22, $23,
@@ -343,7 +343,7 @@ router.post('/leads/webhook', async (req, res) => {
 
         if (sourceUrl.match(/linkedin\.com\/talent/i)) {
             // ─── LinkedIn ───
-            source = 'Linkedin';
+            source = 'LinkedIn';
             const cleanWssp = wssp ? wssp.replace(/^\+/, '') : null;
             const hasWssp = cleanWssp ? await verifyWhatsApp(cleanWssp) : false;
             candidateData = {
@@ -399,9 +399,29 @@ router.post('/leads/webhook', async (req, res) => {
 
         const candidateId = await createCandidate(candidateData, source);
 
+        const candidateName = candidateData.nombreCompleto
+            || candidateData.nombre_candidato
+            || (Array.isArray(candidateData.nombre) ? candidateData.nombre[0] : candidateData.nombre)
+            || 'Sin nombre';
+
+        await pool.query(`
+            INSERT INTO activity_logs (id, actor_id, action, entity_type, entity_id, description, details)
+            VALUES (gen_random_uuid(), NULL, 'Lead Recibido', 'Candidate', $1, $2, $3)
+        `, [
+            candidateId,
+            `Nuevo lead desde ${source}: ${candidateName}`,
+            JSON.stringify({
+                source,
+                profile_url: sourceUrl,
+                email: dupEmail,
+                phone: candidateData.telefono || candidateData.phone || null,
+                whatsapp_verified: !!candidateData.whatsapp,
+            }),
+        ]);
+
         logErrorToSlack('info', {
             category: 'recruitment', action: 'lead.created',
-            message: `✅ Nuevo lead desde ${source}: ${candidateData.nombreCompleto || candidateData.nombre || 'Sin nombre'}`,
+            message: `✅ Nuevo lead desde ${source}: ${candidateName}`,
             module: 'leads-webhook',
             details: { candidateId, source, email: dupEmail },
         });
