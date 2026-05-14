@@ -212,7 +212,9 @@ new Worker('email', async (job) => {
 
 async function runRecruitmentEmailJob({ accountEmail, to, subject, bodyHtml: bodyHtmlIn, candidateId, attachments, jobId }) {
     let bodyHtml = bodyHtmlIn;
+    const breadcrumb = (step) => console.log(`   [Recruitment ${jobId}] ${step}`);
 
+    breadcrumb('1. Querying gmail_accounts...');
     const { data: account, error: accountErr } = await supabaseAdmin
         .from('gmail_accounts')
         .select('*')
@@ -221,6 +223,7 @@ async function runRecruitmentEmailJob({ accountEmail, to, subject, bodyHtml: bod
 
     if (accountErr) throw new Error(`supabaseAdmin gmail_accounts query failed: ${accountErr.message}`);
     if (!account) throw new Error(`No recruitment Gmail account found: ${accountEmail}`);
+    breadcrumb('2. Got account, hydrating attachments...');
 
     let accessToken = account.access_token;
 
@@ -256,8 +259,12 @@ async function runRecruitmentEmailJob({ accountEmail, to, subject, bodyHtml: bod
     // Hydrate attachments: download each URL and base64-encode for the MIME multipart
     const hydrated = [];
     for (const att of (attachments || [])) {
+        breadcrumb(`3. Downloading attachment ${att.url}...`);
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 25000);
         try {
-            const r = await fetch(att.url);
+            const r = await fetch(att.url, { signal: ctrl.signal });
+            clearTimeout(timer);
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             const buf = Buffer.from(await r.arrayBuffer());
             hydrated.push({
@@ -265,18 +272,27 @@ async function runRecruitmentEmailJob({ accountEmail, to, subject, bodyHtml: bod
                 mimeType: att.mimeType || r.headers.get('content-type') || 'application/octet-stream',
                 data: buf.toString('base64'),
             });
+            breadcrumb(`3. Downloaded ${buf.length} bytes`);
         } catch (err) {
+            clearTimeout(timer);
             console.error(`[Recruitment] Failed to download attachment ${att.url}:`, err.message);
+            // We don't throw — sending the email without attachment is better than not sending
         }
     }
 
+    breadcrumb('4. Building raw email...');
     let message = buildRawEmail({ from: accountEmail, to, subject, htmlBody: bodyHtml, attachments: hydrated });
 
+    breadcrumb('5. Calling Gmail API...');
     let response = await sendGmail(accessToken, accountEmail, message);
+    breadcrumb(`5. Gmail responded ${response.status}`);
 
     if (response.status === 401) {
+        breadcrumb('6. Refreshing token...');
         accessToken = await getAccessToken(account.refresh_token, 'gmail_accounts', 'email_address', accountEmail);
+        breadcrumb('6. Retrying send with new token...');
         response = await sendGmail(accessToken, accountEmail, message);
+        breadcrumb(`6. Gmail responded ${response.status}`);
     }
 
     if (!response.ok) {
@@ -310,14 +326,21 @@ async function sendGmail(accessToken, email, raw, threadId) {
     const body = { raw };
     if (threadId) body.threadId = threadId;
 
-    return fetch(`https://gmail.googleapis.com/gmail/v1/users/${email}/messages/send`, {
-        method: 'POST',
-        headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 20000);
+    try {
+        return await fetch(`https://gmail.googleapis.com/gmail/v1/users/${email}/messages/send`, {
+            signal: ctrl.signal,
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(body),
+        });
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 function buildRawEmail({ from, to, cc, bcc, subject, htmlBody, inReplyTo, attachments }) {
