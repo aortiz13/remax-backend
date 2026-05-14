@@ -48,6 +48,149 @@ async function getAccessToken(refreshToken, accountTable, emailField, emailValue
 }
 
 // =============================================
+// Helper: persist a sent email into email_threads + email_messages so it
+// shows up in the user's Casilla "Enviados" tab.
+//
+// Used to live in the Supabase Edge Function `gmail-send` (`saveSentMessageToDb`).
+// Got dropped when the send flow migrated to this BullMQ worker, which is why
+// every email sent from the CRM since the migration disappeared from the
+// Casilla view (still arrived to the recipient and to Gmail's own Sent folder,
+// but never wrote back to our DB).
+//
+// Never throws — the email already went out; failing to persist the CRM-side
+// row should not retry the Gmail send.
+// =============================================
+async function saveSentMessageToCasilla({
+    agentId,
+    fromAddress,
+    toAddress,
+    ccAddress,
+    subject,
+    bodyHtml,
+    gmailMessageId,
+    gmailThreadId,
+    attachments,
+}) {
+    try {
+        if (!gmailMessageId || !gmailThreadId) {
+            console.warn('[Casilla] saveSentMessageToCasilla called without Gmail ids, skipping');
+            return;
+        }
+
+        // 1) Try to link to a contact by recipient email
+        let contactId = null;
+        if (toAddress) {
+            const cleanedEmail = (toAddress.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/) || [])[1] || toAddress.trim();
+            const { data: contacts } = await supabaseAdmin
+                .from('contacts').select('id').ilike('email', cleanedEmail).limit(1);
+            if (contacts?.length) contactId = contacts[0].id;
+        }
+
+        // 2) Upsert the thread (merge SENT label if it already exists)
+        const { data: existingThread } = await supabaseAdmin
+            .from('email_threads').select('id, labels')
+            .eq('gmail_thread_id', gmailThreadId).maybeSingle();
+
+        if (existingThread) {
+            const mergedLabels = Array.from(new Set([...(existingThread.labels || []), 'SENT']));
+            await supabaseAdmin
+                .from('email_threads')
+                .update({ labels: mergedLabels, updated_at: new Date().toISOString() })
+                .eq('gmail_thread_id', gmailThreadId);
+        } else {
+            const threadData = {
+                gmail_thread_id: gmailThreadId,
+                agent_id: agentId,
+                subject: subject || '(Sin Asunto)',
+                labels: ['SENT'],
+                updated_at: new Date().toISOString(),
+            };
+            if (contactId) threadData.contact_id = contactId;
+            await supabaseAdmin.from('email_threads').upsert(threadData, { onConflict: 'gmail_thread_id' });
+        }
+
+        const { data: threadRecord } = await supabaseAdmin
+            .from('email_threads').select('id').eq('gmail_thread_id', gmailThreadId).single();
+        if (!threadRecord) {
+            console.error('[Casilla] Could not find thread row after upsert for', gmailThreadId);
+            return;
+        }
+
+        // 3) Upsert the message row
+        const { error: msgError } = await supabaseAdmin
+            .from('email_messages')
+            .upsert({
+                gmail_message_id: gmailMessageId,
+                thread_id: threadRecord.id,
+                agent_id: agentId,
+                from_address: fromAddress,
+                to_address: toAddress,
+                cc_address: ccAddress || null,
+                subject: subject,
+                body_html: bodyHtml,
+                received_at: new Date().toISOString(),
+                is_read: true, // sent by us — always read
+            }, { onConflict: 'gmail_message_id' });
+
+        if (msgError) {
+            console.error('[Casilla] Error upserting email_messages:', msgError);
+            return;
+        }
+
+        const { data: messageRecord } = await supabaseAdmin
+            .from('email_messages').select('id').eq('gmail_message_id', gmailMessageId).single();
+        if (!messageRecord) {
+            console.error('[Casilla] Could not find message row after upsert');
+            return;
+        }
+
+        // 4) Persist attachments (storage + DB row each)
+        if (attachments?.length) {
+            for (const attachment of attachments) {
+                try {
+                    const base64 = (attachment.data || '').replace(/-/g, '+').replace(/_/g, '/');
+                    if (!base64) continue;
+                    const buffer = Buffer.from(base64, 'base64');
+                    const safeFilename = (attachment.filename || 'attachment.bin')
+                        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+                        .replace(/[^a-zA-Z0-9._\-]/g, '_');
+                    const filePath = `${threadRecord.id}/${messageRecord.id}/${safeFilename}`;
+
+                    const { error: uploadError } = await supabaseAdmin.storage
+                        .from('email_attachments')
+                        .upload(filePath, buffer, {
+                            contentType: attachment.mimeType || 'application/octet-stream',
+                            upsert: true,
+                        });
+
+                    if (uploadError) {
+                        console.error(`[Casilla] Storage upload failed for ${attachment.filename}:`, uploadError);
+                        continue;
+                    }
+
+                    const { data: publicUrlData } = supabaseAdmin.storage
+                        .from('email_attachments').getPublicUrl(filePath);
+
+                    await supabaseAdmin.from('email_attachments').insert({
+                        message_id: messageRecord.id,
+                        filename: attachment.filename,
+                        file_size: buffer.length,
+                        mime_type: attachment.mimeType || 'application/octet-stream',
+                        storage_url: publicUrlData.publicUrl,
+                    });
+                } catch (attErr) {
+                    console.error(`[Casilla] Attachment exception ${attachment.filename}:`, attErr.message);
+                }
+            }
+        }
+
+        console.log(`[Casilla] Sent message ${gmailMessageId} persisted to email_messages.`);
+    } catch (err) {
+        console.error('[Casilla] saveSentMessageToCasilla failed (non-fatal):', err.message);
+    }
+}
+
+// =============================================
 // 📧 EMAIL WORKER — sends emails via Gmail API
 // =============================================
 new Worker('email', async (job) => {
@@ -169,6 +312,20 @@ new Worker('email', async (job) => {
         message: `Email entregado a Gmail: ${account.email_address} → ${to}`,
         user_id: agentId, user_email: account.email_address,
         details: { to, from: account.email_address, subject, gmail_message_id: result.id, tracking_id: trackingId, job_id: job.id },
+    });
+
+    // Mirror the message into our DB so it shows up in Casilla → Enviados.
+    // (Never throws — the email is already out.)
+    await saveSentMessageToCasilla({
+        agentId,
+        fromAddress: account.email_address,
+        toAddress: to,
+        ccAddress: Array.isArray(cc) ? cc.join(', ') : (cc || null),
+        subject,
+        bodyHtml: htmlBody,
+        gmailMessageId: result.id,
+        gmailThreadId: result.threadId,
+        attachments,
     });
 
     return result;
@@ -329,6 +486,29 @@ async function runRecruitmentEmailJob({ accountEmail, to, subject, bodyHtml: bod
 
     const result = await response.json();
     console.log(`✅ [Recruitment] Email sent: ${result.id}`);
+
+    // Same defense as the per-agent worker: a real Gmail send always returns
+    // an id. Refuse to claim success otherwise.
+    if (!result?.id) {
+        throw new Error(`Gmail returned 200 with no message id (body: ${JSON.stringify(result)?.substring(0, 200)})`);
+    }
+
+    // Also mirror the message into email_threads/email_messages so it shows up
+    // in the recruiter's Casilla → Enviados tab. The account here is the shared
+    // emprendedores@ row in gmail_accounts; its agent_id determines whose
+    // mailbox view will include the message.
+    await saveSentMessageToCasilla({
+        agentId: account.agent_id,
+        fromAddress: accountEmail,
+        toAddress: to,
+        ccAddress: null,
+        subject,
+        bodyHtml,
+        gmailMessageId: result.id,
+        gmailThreadId: result.threadId,
+        attachments: hydrated,
+    });
+
     return result;
 }
 
