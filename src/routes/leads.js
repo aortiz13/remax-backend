@@ -2,6 +2,7 @@ import express from 'express';
 import pool from '../lib/db.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import { emailQueue } from '../queues/index.js';
+import Anthropic from '@anthropic-ai/sdk';
 
 const router = express.Router();
 
@@ -612,6 +613,109 @@ router.post('/leads/from-email', async (req, res) => {
         res.json({ success: true, candidateId });
     } catch (error) {
         console.error('Email lead error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// POST /api/recruitment/templates/ai-generate
+// Genera el HTML brandeado de una plantilla de email desde un prompt
+// libre. Llama al LLM y devuelve { subject, body_html } listo para
+// pegarse en el editor de /recruitment/templates.
+// ============================================================
+const anthropicClient = process.env.ANTHROPIC_API_KEY
+    ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+    : null;
+
+const TEMPLATE_SYSTEM_PROMPT = `Sos un asistente que genera plantillas de email para RE/MAX Exclusive (inmobiliaria, oficina en Chile). Tu output va a ser pegado directamente en un editor de plantillas que ya hace la sustitución de variables Mustache-style.
+
+DEBÉS responder EXCLUSIVAMENTE con un JSON válido con esta forma:
+{
+  "subject": "...asunto del email...",
+  "body_html": "<!DOCTYPE html>...HTML completo del cuerpo del email..."
+}
+
+NUNCA agregues texto antes o después del JSON. Nada de markdown, ni \`\`\`json. Solo el objeto.
+
+Brand del HTML:
+- Familia tipográfica: 'Open Sans', Arial, sans-serif.
+- Colores: azul RE/MAX #003DA5, rojo RE/MAX #E11B22.
+- Container blanco \`max-width:800px;border-radius:20px;box-shadow:0 4px 20px rgba(0,0,0,0.1)\` sobre fondo \`#f5f5f5\`.
+- Padding interno 40px 35px, color de texto #333, line-height 1.8, font-size 15px, text-align justify.
+- Botón CTA: \`display:inline-block;background-color:#E11B22;color:#ffffff;text-decoration:none;padding:14px 35px;border-radius:50px;font-weight:600;font-size:15px\`.
+- Saludo en 16px, margin-bottom 25px, con \`<strong>\` alrededor del nombre.
+- Firma al final, centrada, usando esta imagen exacta: \`<img src="https://res.cloudinary.com/dhzmkxbek/image/upload/v1765805558/FIRMA_EMAIL_600_x_400_px_KAREM_BRUSCA_sh0ng4.jpg" alt="Karem Brusca - Reclutamiento" style="max-width:100%;height:auto;">\` dentro de un \`<div style="margin:40px 0 20px 0;text-align:center;">\`.
+- Todo el styling debe ir inline (Gmail no soporta <style>).
+
+Usá las siguientes variables Mustache cuando corresponda (no las "rellenes", dejalas literales con doble llave):
+- {{nombre}} → primer nombre del candidato.
+- {{apellido}} → apellido.
+- {{nombre_completo}} → nombre completo.
+- {{email}}, {{telefono}}, {{ciudad}}.
+- {{fecha_reunion}}, {{ubicacion_reunion}}.
+- {{form_url}} → link al formulario de aprobación, personalizado por candidato.
+- {{oficinas_url}} → link al directorio de oficinas RE/MAX Chile.
+- {{candidate_id}} → UUID interno del candidato (usar solo si el usuario lo pide explícitamente).
+
+El HTML debe empezar con \`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>RE/MAX Exclusive Chile</title></head><body style="margin:0;padding:0;font-family:'Open Sans',Arial,sans-serif;background-color:#f5f5f5;">\` y respetar la estructura del template ya existente.
+
+Si el usuario pide un email que ya tiene asunto definido, usalo. Si no, generá un asunto corto y profesional.`;
+
+router.post('/templates/ai-generate', async (req, res) => {
+    try {
+        if (!anthropicClient) {
+            return res.status(503).json({ error: 'AI provider not configured (ANTHROPIC_API_KEY missing)' });
+        }
+        const { prompt, currentBodyHtml, currentSubject } = req.body || {};
+        if (!prompt || !String(prompt).trim()) {
+            return res.status(400).json({ error: 'prompt is required' });
+        }
+
+        const userMessage = [
+            `Necesito que generes una plantilla de email con este pedido:`,
+            ``,
+            String(prompt).trim(),
+            ``,
+            currentSubject ? `Asunto actual: ${currentSubject}` : null,
+            currentBodyHtml
+                ? `HTML actual (mejorá/reescribí sobre esto):\n${currentBodyHtml.slice(0, 8000)}`
+                : null,
+        ].filter(Boolean).join('\n');
+
+        const response = await anthropicClient.messages.create({
+            model: 'claude-sonnet-4-6',
+            max_tokens: 4096,
+            system: TEMPLATE_SYSTEM_PROMPT,
+            messages: [{ role: 'user', content: userMessage }],
+        });
+
+        const text = response.content
+            .filter(c => c.type === 'text')
+            .map(c => c.text)
+            .join('');
+
+        // Best-effort JSON extraction in case the model wraps the output
+        let parsed;
+        try {
+            parsed = JSON.parse(text);
+        } catch {
+            const match = text.match(/\{[\s\S]*\}/);
+            if (!match) throw new Error('LLM did not return JSON');
+            parsed = JSON.parse(match[0]);
+        }
+
+        if (!parsed.subject || !parsed.body_html) {
+            throw new Error('LLM response missing subject or body_html');
+        }
+
+        res.json({ subject: parsed.subject, body_html: parsed.body_html });
+    } catch (error) {
+        console.error('AI generate template error:', error);
+        logErrorToSlack('error', {
+            category: 'recruitment', action: 'templates.ai_generate_error',
+            message: error.message,
+            module: 'leads-ai',
+        });
         res.status(500).json({ error: error.message });
     }
 });
