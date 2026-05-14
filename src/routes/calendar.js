@@ -3,6 +3,12 @@ import authMiddleware from '../middleware/auth.js';
 import supabaseAdmin from '../lib/supabaseAdmin.js';
 import { calendarQueue } from '../queues/index.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
+import {
+    listUpcomingEventTitles,
+    resolveCalendarEventVars,
+    findNextEventByTitle,
+    formatEventDateEs,
+} from '../lib/calendarVariables.js';
 
 const router = Router();
 
@@ -331,6 +337,86 @@ router.post('/sync', authMiddleware, async (req, res) => {
             module: 'calendar', details: { action: req.body?.action },
         });
         res.status(400).json({ error: error.message });
+    }
+});
+
+// ───────────────────────────────────────────────────────────────────
+// Calendar event variables ({{evento:NombreDelEvento}})
+//
+// Lets the email composer / template editor offer a picker of
+// calendar event titles, and pre-render those variables before sending
+// (replicates n8n workflow FMcwnmnMezHOfUVm — "Buscar_eventos" +
+// "Formatear fecha").
+// ───────────────────────────────────────────────────────────────────
+
+// GET /api/calendar/event-names?limit=50
+router.get('/event-names', authMiddleware, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit || '50', 10) || 50, 200);
+        const agentId = req.user?.id || null;
+        const items = await listUpcomingEventTitles({ limit, agentId });
+
+        const events = items.map(row => ({
+            title: row.title,
+            next_at: row.next_at,
+            location: row.location || null,
+            preview: formatEventDateEs(row.next_at, { mode: 'fecha_y_hora' }),
+        }));
+
+        res.json({ events });
+    } catch (error) {
+        logErrorToSlack('error', {
+            category: 'backend', action: 'calendar.event_names', message: error.message,
+            module: 'calendar',
+        });
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// POST /api/calendar/render-vars
+// Body: { subject?: string, bodyHtml?: string, text?: string }
+// Returns: { subject, bodyHtml, text } with {{evento:...}} substituted.
+router.post('/render-vars', authMiddleware, async (req, res) => {
+    try {
+        const { subject, bodyHtml, text } = req.body || {};
+        const [renderedSubject, renderedBody, renderedText] = await Promise.all([
+            resolveCalendarEventVars(subject || ''),
+            resolveCalendarEventVars(bodyHtml || ''),
+            resolveCalendarEventVars(text || ''),
+        ]);
+        res.json({
+            subject: renderedSubject,
+            bodyHtml: renderedBody,
+            text: renderedText,
+        });
+    } catch (error) {
+        logErrorToSlack('error', {
+            category: 'backend', action: 'calendar.render_vars', message: error.message,
+            module: 'calendar',
+        });
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// GET /api/calendar/event-resolve?title=...
+// Convenience: returns the next occurrence of an event by name.
+router.get('/event-resolve', authMiddleware, async (req, res) => {
+    try {
+        const title = (req.query.title || '').toString();
+        if (!title.trim()) return res.status(400).json({ error: 'title is required' });
+        const event = await findNextEventByTitle(title);
+        if (!event) return res.json({ event: null });
+        res.json({
+            event: {
+                title: event.title,
+                execution_date: event.execution_date,
+                end_date: event.end_date,
+                location: event.location || null,
+                formatted: formatEventDateEs(event.execution_date),
+            },
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 

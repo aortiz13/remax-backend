@@ -3,6 +3,7 @@ import pool from '../lib/db.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import { recruitmentEmailQueue } from '../queues/index.js';
 import { uploadFile } from '../lib/storage.js';
+import { resolveCalendarEventVars } from '../lib/calendarVariables.js';
 import Busboy from 'busboy';
 import crypto from 'crypto';
 
@@ -567,8 +568,13 @@ async function executeEmailRule(rule, candidate) {
     const accountEmail = accountRows[0].email_address;
 
     const vars = buildTemplateVars(candidate);
-    const subject = renderTemplateVars(tpl.subject, vars);
-    const bodyHtml = renderTemplateVars(tpl.body_html, vars);
+    let subject = renderTemplateVars(tpl.subject, vars);
+    let bodyHtml = renderTemplateVars(tpl.body_html, vars);
+
+    // Resolve {{evento:NombreDelEvento}} placeholders against the recruitment /
+    // CRM calendars (replicates the n8n "Buscar_eventos" + "Formatear fecha" flow).
+    subject = await resolveCalendarEventVars(subject);
+    bodyHtml = await resolveCalendarEventVars(bodyHtml);
 
     const attachments = Array.isArray(rule.attachments_json) ? rule.attachments_json : [];
 
@@ -602,7 +608,8 @@ async function executeEmailRule(rule, candidate) {
 async function executeTaskRule(rule, candidate) {
     if (!rule.task_title) throw new Error(`Rule ${rule.id} has no task_title`);
     const vars = buildTemplateVars(candidate);
-    const title = renderTemplateVars(rule.task_title, vars);
+    let title = renderTemplateVars(rule.task_title, vars);
+    title = await resolveCalendarEventVars(title);
     await pool.query(`
         INSERT INTO recruitment_tasks (candidate_id, title, task_type, priority, completed, due_date)
         VALUES ($1, $2, $3, 'media', false, NOW() + INTERVAL '1 day')
