@@ -165,7 +165,7 @@ new Worker('email', async (job) => {
 new Worker('email', async (job) => {
     if (job.name !== 'send-recruitment-email') return;
 
-    const { accountEmail, to, subject, bodyHtml, candidateId } = job.data;
+    const { accountEmail, to, subject, bodyHtml, candidateId, attachments } = job.data;
     console.log(`📧 [Recruitment] Sending email to ${to} via ${accountEmail}...`);
 
     const { data: account } = await supabaseAdmin
@@ -207,7 +207,24 @@ new Worker('email', async (job) => {
         }
     }
 
-    let message = buildRawEmail({ from: accountEmail, to, subject, htmlBody: bodyHtml });
+    // Hydrate attachments: download each URL and base64-encode for the MIME multipart
+    const hydrated = [];
+    for (const att of (attachments || [])) {
+        try {
+            const r = await fetch(att.url);
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const buf = Buffer.from(await r.arrayBuffer());
+            hydrated.push({
+                filename: att.filename || att.url.split('/').pop() || 'attachment',
+                mimeType: att.mimeType || r.headers.get('content-type') || 'application/octet-stream',
+                data: buf.toString('base64'),
+            });
+        } catch (err) {
+            console.error(`[Recruitment] Failed to download attachment ${att.url}:`, err.message);
+        }
+    }
+
+    let message = buildRawEmail({ from: accountEmail, to, subject, htmlBody: bodyHtml, attachments: hydrated });
 
     let response = await sendGmail(accessToken, accountEmail, message);
 
