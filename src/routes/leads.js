@@ -415,11 +415,13 @@ router.post('/leads/webhook', async (req, res) => {
 });
 
 // ============================================================
-// POST /api/recruitment/candidates/:id/post-meeting-decision
-// Envía el email de Aprobación o Rechazo al mover el candidato post-reunión.
-// Toma la plantilla por defecto de `recruitment_email_templates` (category =
-// 'Aprobación' o 'Rechazo'), renderiza variables, encola el envío vía
-// emprendedores@ y adjunta el PDF de "Por qué ser un Agente RE/MAX" si aplica.
+// POST /api/recruitment/candidates/:id/stage-changed
+// Endpoint genérico: el frontend lo llama con cualquier stage al que
+// se mueva el candidato. El backend lee recruitment_automation_rules
+// activas para esa etapa y las ejecuta (email + tareas).
+//
+// El antiguo /post-meeting-decision queda como wrapper retrocompatible
+// y delega acá.
 // ============================================================
 const APROBADO_PDF_URL = process.env.APROBADO_PDF_URL ||
     'https://res.cloudinary.com/dhzmkxbek/image/upload/v1771201266/Por_que%CC%81_ser_un_Agente_REMAX_-_I_Trimestre_2026_veqbvc.pdf';
@@ -432,153 +434,197 @@ function renderTemplateVars(text, vars) {
     return out;
 }
 
-router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
-    const { id } = req.params;
-    const { decision } = req.body || {};
+function buildTemplateVars(candidate) {
+    const FORMS_URL = process.env.FORMS_URL || 'https://forms.remax-exclusive.cl';
+    const fullName = `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato';
+    return {
+        '{{nombre}}': candidate.first_name || '',
+        '{{apellido}}': candidate.last_name || '',
+        '{{nombre_completo}}': fullName,
+        '{{email}}': candidate.email || '',
+        '{{telefono}}': candidate.phone || candidate.whatsapp || '',
+        '{{ciudad}}': candidate.city || '',
+        '{{form_url}}': `${FORMS_URL}/postular?cid=${candidate.id}`,
+        '{{oficinas_url}}': 'https://rem.ax/OficinasREMAXChile',
+        '{{candidate_id}}': candidate.id,
+    };
+}
 
-    const normalized = String(decision || '').toLowerCase();
-    if (normalized !== 'aprobado' && normalized !== 'desaprobado') {
-        return res.status(400).json({ error: 'decision must be "aprobado" or "desaprobado"' });
+async function executeEmailRule(rule, candidate) {
+    if (!candidate.email) {
+        throw new Error('Candidate has no email');
     }
-    const estado = normalized === 'aprobado' ? 'Aprobado' : 'Desaprobado';
-    const templateCategory = normalized === 'aprobado' ? 'Aprobación' : 'Rechazo';
+
+    // A/B pick
+    let templateId = rule.template_id;
+    let abVariant = null;
+    if (rule.ab_enabled && rule.ab_template_b_id) {
+        const useB = Math.random() < 0.5;
+        templateId = useB ? rule.ab_template_b_id : rule.template_id;
+        abVariant = useB ? 'B' : 'A';
+    }
+
+    if (!templateId) throw new Error(`Rule ${rule.id} has no template_id`);
+
+    const { rows: tplRows } = await pool.query(
+        `SELECT id, subject, body_html FROM recruitment_email_templates WHERE id = $1`,
+        [templateId],
+    );
+    if (!tplRows.length) throw new Error(`Template ${templateId} not found`);
+    const tpl = tplRows[0];
+
+    const { rows: accountRows } = await pool.query(
+        `SELECT email_address FROM gmail_accounts WHERE purpose = 'recruitment' LIMIT 1`,
+    );
+    if (!accountRows.length) throw new Error('emprendedores@ Gmail account not connected');
+    const accountEmail = accountRows[0].email_address;
+
+    const vars = buildTemplateVars(candidate);
+    const subject = renderTemplateVars(tpl.subject, vars);
+    const bodyHtml = renderTemplateVars(tpl.body_html, vars);
+
+    const attachments = Array.isArray(rule.attachments_json) ? rule.attachments_json : [];
+
+    await recruitmentEmailQueue.add('send-recruitment-email', {
+        accountEmail,
+        to: candidate.email,
+        subject,
+        bodyHtml,
+        candidateId: candidate.id,
+        templateId,
+        abVariant,
+        attachments,
+        sentBy: null,
+    }, {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 5000 },
+        delay: (rule.delay_minutes || 0) * 60 * 1000,
+    });
+
+    await pool.query(`
+        INSERT INTO recruitment_email_logs
+            (candidate_id, email_type, subject, body_html, to_email, status, sent_at, ab_variant, metadata)
+        VALUES ($1, $2, $3, $4, $5, 'queued', NOW(), $6, $7)
+    `, [
+        candidate.id, 'Automation', subject, bodyHtml, candidate.email,
+        abVariant,
+        JSON.stringify({ rule_id: rule.id, template_id: templateId, trigger: 'automation_rule' }),
+    ]);
+}
+
+async function executeTaskRule(rule, candidate) {
+    if (!rule.task_title) throw new Error(`Rule ${rule.id} has no task_title`);
+    const vars = buildTemplateVars(candidate);
+    const title = renderTemplateVars(rule.task_title, vars);
+    await pool.query(`
+        INSERT INTO recruitment_tasks (candidate_id, title, task_type, priority, completed, due_date)
+        VALUES ($1, $2, $3, 'media', false, NOW() + INTERVAL '1 day')
+    `, [candidate.id, title, rule.task_type || 'Seguimiento']);
+}
+
+async function executeRulesForStage(candidate, stage) {
+    const { rows: rules } = await pool.query(
+        `SELECT id, action_type, template_id, ab_enabled, ab_template_b_id,
+                task_title, task_type, delay_minutes, attachments_json
+           FROM recruitment_automation_rules
+          WHERE trigger_stage = $1 AND is_active = true`,
+        [stage],
+    );
+
+    if (!rules.length) return { rulesFound: 0, rulesExecuted: 0 };
+
+    let executed = 0;
+    const failures = [];
+    for (const rule of rules) {
+        try {
+            if (rule.action_type === 'send_email') {
+                await executeEmailRule(rule, candidate);
+            } else if (rule.action_type === 'create_task') {
+                await executeTaskRule(rule, candidate);
+            } else {
+                throw new Error(`Unknown action_type: ${rule.action_type}`);
+            }
+            executed++;
+        } catch (err) {
+            console.error(`[Automation] Rule ${rule.id} failed:`, err.message);
+            failures.push({ ruleId: rule.id, error: err.message });
+            logErrorToSlack('error', {
+                category: 'recruitment',
+                action: 'automation_rule.error',
+                message: `❌ Regla ${rule.id} (${rule.action_type}) falló para candidato ${candidate.id} en etapa ${stage}: ${err.message}`,
+                module: 'leads-automation',
+                details: { candidateId: candidate.id, stage, ruleId: rule.id, error: err.message },
+            });
+        }
+    }
+    return { rulesFound: rules.length, rulesExecuted: executed, failures };
+}
+
+router.post('/candidates/:id/stage-changed', async (req, res) => {
+    const { id } = req.params;
+    const { stage } = req.body || {};
+    if (!stage) return res.status(400).json({ error: 'stage is required in body' });
+    const normalizedStage = String(stage).toLowerCase();
 
     try {
         const { rows } = await pool.query(
             `SELECT id, first_name, last_name, email, phone, whatsapp, city
-               FROM recruitment_candidates
-              WHERE id = $1
-              LIMIT 1`,
+               FROM recruitment_candidates WHERE id = $1 LIMIT 1`,
             [id],
         );
-
-        if (rows.length === 0) {
-            return res.status(404).json({ error: 'Candidate not found' });
-        }
-
+        if (!rows.length) return res.status(404).json({ error: 'Candidate not found' });
         const candidate = rows[0];
-        const fullName = `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato';
 
-        if (!candidate.email) {
-            logErrorToSlack('warning', {
+        const result = await executeRulesForStage(candidate, normalizedStage);
+
+        if (result.rulesExecuted > 0) {
+            const fullName = `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato';
+            logErrorToSlack('info', {
                 category: 'recruitment',
-                action: 'post_meeting.missing_email',
-                message: `Candidato ${id} movido a ${estado} pero no tiene email`,
-                module: 'leads-decision',
-                details: { candidateId: id, estado },
+                action: 'stage_changed.rules_executed',
+                message: `🤖 ${result.rulesExecuted}/${result.rulesFound} reglas ejecutadas para ${fullName} → ${normalizedStage}`,
+                module: 'leads-automation',
+                details: { candidateId: id, stage: normalizedStage, ...result },
             });
-            return res.status(422).json({ error: 'Candidate has no email', emailSent: false });
         }
 
-        // Pick default template for this decision
-        const { rows: tplRows } = await pool.query(
-            `SELECT id, subject, body_html
-               FROM recruitment_email_templates
-              WHERE category = $1 AND is_default = true
-              ORDER BY updated_at DESC NULLS LAST
-              LIMIT 1`,
-            [templateCategory],
-        );
-
-        if (tplRows.length === 0) {
-            logErrorToSlack('error', {
-                category: 'recruitment',
-                action: 'post_meeting.no_template',
-                message: `No hay plantilla default para categoría '${templateCategory}'`,
-                module: 'leads-decision',
-                details: { candidateId: id, estado },
-            });
-            return res.status(500).json({ error: `No default template configured for '${templateCategory}'` });
-        }
-        const tpl = tplRows[0];
-
-        // Find recruitment Gmail account (emprendedores@)
-        const { rows: accountRows } = await pool.query(
-            `SELECT email_address FROM gmail_accounts WHERE purpose = 'recruitment' LIMIT 1`,
-        );
-        if (accountRows.length === 0) {
-            logErrorToSlack('warning', {
-                category: 'recruitment',
-                action: 'post_meeting.no_gmail_account',
-                message: `⚠️ Candidato ${fullName} movido a ${estado} pero la cuenta emprendedores@ no está conectada en /casilla. Email NO enviado.`,
-                module: 'leads-decision',
-                details: { candidateId: id, estado },
-            });
-            return res.status(400).json({
-                error: 'Recruitment Gmail account (emprendedores@) not connected. Connect it from /casilla first.',
-            });
-        }
-        const accountEmail = accountRows[0].email_address;
-
-        // Render template variables
-        const FORMS_URL = process.env.FORMS_URL || 'https://forms.remax-exclusive.cl';
-        const vars = {
-            '{{nombre}}': candidate.first_name || '',
-            '{{apellido}}': candidate.last_name || '',
-            '{{nombre_completo}}': fullName,
-            '{{email}}': candidate.email,
-            '{{telefono}}': candidate.phone || candidate.whatsapp || '',
-            '{{ciudad}}': candidate.city || '',
-            '{{form_url}}': `${FORMS_URL}/postular?cid=${id}`,
-            '{{oficinas_url}}': 'https://rem.ax/OficinasREMAXChile',
-            '{{candidate_id}}': id,
-        };
-        const subject = renderTemplateVars(tpl.subject, vars);
-        const bodyHtml = renderTemplateVars(tpl.body_html, vars);
-
-        // PDF de presentación solo para el email de Aprobado
-        const attachments = estado === 'Aprobado'
-            ? [{
-                url: APROBADO_PDF_URL,
-                filename: 'Por que ser un Agente RE-MAX.pdf',
-                mimeType: 'application/pdf',
-            }]
-            : [];
-
-        // Enqueue email send on the dedicated recruitment-email queue so the
-        // generic per-agent email worker doesn't accidentally claim the job.
-        await recruitmentEmailQueue.add('send-recruitment-email', {
-            accountEmail,
-            to: candidate.email,
-            subject,
-            bodyHtml,
-            candidateId: id,
-            templateId: tpl.id,
-            attachments,
-            sentBy: null,
-        }, {
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 5000 },
-        });
-
-        // Initial log
-        await pool.query(`
-            INSERT INTO recruitment_email_logs
-                (candidate_id, email_type, subject, body_html, to_email, status, sent_at, metadata)
-            VALUES ($1, $2, $3, $4, $5, 'queued', NOW(), $6)
-        `, [
-            id, estado, subject, bodyHtml, candidate.email,
-            JSON.stringify({ template_id: tpl.id, trigger: 'post_meeting_decision' }),
-        ]);
-
-        logErrorToSlack('info', {
-            category: 'recruitment',
-            action: 'post_meeting.email_queued',
-            message: `📧 Email ${estado} encolado para ${fullName} (${candidate.email})`,
-            module: 'leads-decision',
-            details: { candidateId: id, templateId: tpl.id },
-        });
-
-        res.json({ success: true, candidateId: id, estado, emailQueued: true });
+        res.json({ success: true, candidateId: id, stage: normalizedStage, ...result });
     } catch (error) {
-        console.error('Post-meeting decision error:', error);
+        console.error('Stage-changed automation error:', error);
         logErrorToSlack('error', {
             category: 'recruitment',
-            action: 'post_meeting.error',
+            action: 'stage_changed.error',
             message: error.message,
-            module: 'leads-decision',
-            details: { candidateId: id },
+            module: 'leads-automation',
+            details: { candidateId: id, stage: normalizedStage },
         });
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// POST /api/recruitment/candidates/:id/post-meeting-decision (deprecated)
+// Wrapper retrocompatible. Mantiene la API anterior pero ahora
+// delega al motor de reglas de stage-changed.
+// ============================================================
+router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
+    const { id } = req.params;
+    const { decision } = req.body || {};
+    const normalized = String(decision || '').toLowerCase();
+    if (normalized !== 'aprobado' && normalized !== 'desaprobado') {
+        return res.status(400).json({ error: 'decision must be "aprobado" or "desaprobado"' });
+    }
+    try {
+        const { rows } = await pool.query(
+            `SELECT id, first_name, last_name, email, phone, whatsapp, city
+               FROM recruitment_candidates WHERE id = $1 LIMIT 1`,
+            [id],
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Candidate not found' });
+        const result = await executeRulesForStage(rows[0], normalized);
+        res.json({ success: true, candidateId: id, estado: normalized, ...result });
+    } catch (error) {
+        console.error('Post-meeting decision error:', error);
         res.status(500).json({ error: error.message });
     }
 });
