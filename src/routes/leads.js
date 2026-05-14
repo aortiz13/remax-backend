@@ -497,6 +497,13 @@ router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
             `SELECT email_address FROM gmail_accounts WHERE purpose = 'recruitment' LIMIT 1`,
         );
         if (accountRows.length === 0) {
+            logErrorToSlack('warning', {
+                category: 'recruitment',
+                action: 'post_meeting.no_gmail_account',
+                message: `⚠️ Candidato ${fullName} movido a ${estado} pero la cuenta emprendedores@ no está conectada en /casilla. Email NO enviado.`,
+                module: 'leads-decision',
+                details: { candidateId: id, estado },
+            });
             return res.status(400).json({
                 error: 'Recruitment Gmail account (emprendedores@) not connected. Connect it from /casilla first.',
             });
