@@ -927,6 +927,31 @@ async function processPostularForm(data) {
         details: { candidateId: row.id, email, phone, rut },
     });
 
+    // Fire-and-forget: notify n8n → WhatsApp to José
+    const CRM_URL = process.env.CRM_URL || 'https://solicitudes.remax-exclusive.cl';
+    const candidateLink = `${CRM_URL}/recruitment/candidate/${row.id}`;
+    fetch('https://workflow.remax-exclusive.cl/webhook/postular_completado', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            candidate_id: row.id,
+            full_name: `${firstName} ${lastName}`.trim(),
+            first_name: firstName,
+            last_name: lastName,
+            email: email || '',
+            phone: phone || '',
+            rut: rut || '',
+            birth_date: birthDate || '',
+            marital_status: maritalStatus || '',
+            address: address || '',
+            current_company: currentCompany || '',
+            job_title: jobTitle || '',
+            education_level: educationLevel || '',
+            is_update: isUpdate,
+            candidate_link: candidateLink,
+        }),
+    }).catch(err => console.error('n8n postular webhook failed:', err.message));
+
     return { candidateId: row.id, isUpdate };
 }
 

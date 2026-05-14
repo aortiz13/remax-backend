@@ -467,6 +467,7 @@ router.post('/candidates/:id/post-meeting-decision', async (req, res) => {
                 Nombre: fullName || 'Candidato',
                 email: candidate.email,
                 estado,
+                candidate_id: id,
             }),
         });
 
