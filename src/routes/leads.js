@@ -2,7 +2,6 @@ import express from 'express';
 import pool from '../lib/db.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import { emailQueue } from '../queues/index.js';
-import Anthropic from '@anthropic-ai/sdk';
 
 const router = express.Router();
 
@@ -620,12 +619,14 @@ router.post('/leads/from-email', async (req, res) => {
 // ============================================================
 // POST /api/recruitment/templates/ai-generate
 // Genera el HTML brandeado de una plantilla de email desde un prompt
-// libre. Llama al LLM y devuelve { subject, body_html } listo para
-// pegarse en el editor de /recruitment/templates.
+// libre. Llama al LLM (OpenAI Chat Completions) y devuelve
+// { subject, body_html } listo para pegarse en el editor.
+//
+// La env var ANTHROPIC_API_KEY actualmente contiene una API key de
+// OpenAI (naming legacy) — se usa contra api.openai.com.
 // ============================================================
-const anthropicClient = process.env.ANTHROPIC_API_KEY
-    ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-    : null;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_TEMPLATE_MODEL || 'gpt-4o';
 
 const TEMPLATE_SYSTEM_PROMPT = `Sos un asistente que genera plantillas de email para RE/MAX Exclusive (inmobiliaria, oficina en Chile). Tu output va a ser pegado directamente en un editor de plantillas que ya hace la sustitución de variables Mustache-style.
 
@@ -663,8 +664,8 @@ Si el usuario pide un email que ya tiene asunto definido, usalo. Si no, generá 
 
 router.post('/templates/ai-generate', async (req, res) => {
     try {
-        if (!anthropicClient) {
-            return res.status(503).json({ error: 'AI provider not configured (ANTHROPIC_API_KEY missing)' });
+        if (!OPENAI_API_KEY) {
+            return res.status(503).json({ error: 'AI provider not configured (OPENAI_API_KEY / ANTHROPIC_API_KEY missing)' });
         }
         const { prompt, currentBodyHtml, currentSubject } = req.body || {};
         if (!prompt || !String(prompt).trim()) {
@@ -682,19 +683,33 @@ router.post('/templates/ai-generate', async (req, res) => {
                 : null,
         ].filter(Boolean).join('\n');
 
-        const response = await anthropicClient.messages.create({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 4096,
-            system: TEMPLATE_SYSTEM_PROMPT,
-            messages: [{ role: 'user', content: userMessage }],
+        const r = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+                model: OPENAI_MODEL,
+                messages: [
+                    { role: 'system', content: TEMPLATE_SYSTEM_PROMPT },
+                    { role: 'user', content: userMessage },
+                ],
+                response_format: { type: 'json_object' },
+                max_tokens: 4096,
+                temperature: 0.5,
+            }),
         });
 
-        const text = response.content
-            .filter(c => c.type === 'text')
-            .map(c => c.text)
-            .join('');
+        if (!r.ok) {
+            const errBody = await r.text().catch(() => '');
+            throw new Error(`OpenAI ${r.status}: ${errBody.slice(0, 300)}`);
+        }
 
-        // Best-effort JSON extraction in case the model wraps the output
+        const data = await r.json();
+        const text = data?.choices?.[0]?.message?.content || '';
+        if (!text) throw new Error('LLM returned empty response');
+
         let parsed;
         try {
             parsed = JSON.parse(text);
