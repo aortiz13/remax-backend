@@ -435,7 +435,7 @@ router.post('/sync', authMiddleware, async (req, res) => {
     try {
         const agentId = req.user.id;
         const result = await pool.query(
-            `SELECT id, email_address, access_token, refresh_token, last_history_id FROM gmail_accounts WHERE agent_id = $1 LIMIT 1`,
+            `SELECT id, agent_id, email_address, access_token, refresh_token, last_history_id FROM gmail_accounts WHERE agent_id = $1 LIMIT 1`,
             [agentId]
         );
         if (result.rows.length === 0) return res.status(400).json({ error: 'No Gmail account connected' });
