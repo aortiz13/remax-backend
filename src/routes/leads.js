@@ -2,6 +2,9 @@ import express from 'express';
 import pool from '../lib/db.js';
 import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import { recruitmentEmailQueue } from '../queues/index.js';
+import { uploadFile } from '../lib/storage.js';
+import Busboy from 'busboy';
+import crypto from 'crypto';
 
 const router = express.Router();
 
@@ -411,6 +414,70 @@ router.post('/leads/webhook', async (req, res) => {
             message: error.message, module: 'leads-webhook',
         });
         res.status(500).json({ error: error.message });
+    }
+});
+
+// ============================================================
+// POST /api/recruitment/upload-attachment
+// Uploads a single file from the rule editor (multipart/form-data) to
+// MinIO under email-attachments/recruitment-rules/<uuid>/<filename>.
+// Returns { url, filename, mimeType, size } ready to push into a rule's
+// attachments_json array.
+// ============================================================
+function parseMultipartFile(req) {
+    return new Promise((resolve, reject) => {
+        const bb = Busboy({ headers: req.headers, limits: { fileSize: 25 * 1024 * 1024 } });
+        let captured = null;
+        let truncated = false;
+        bb.on('file', (_name, file, info) => {
+            const chunks = [];
+            file.on('data', (d) => chunks.push(d));
+            file.on('limit', () => { truncated = true; });
+            file.on('end', () => {
+                captured = {
+                    body: Buffer.concat(chunks),
+                    filename: info.filename || 'attachment',
+                    mimeType: info.mimeType || 'application/octet-stream',
+                };
+            });
+        });
+        bb.on('finish', () => {
+            if (truncated) return reject(new Error('File exceeds 25 MB limit'));
+            if (!captured) return reject(new Error('No file in request'));
+            resolve(captured);
+        });
+        bb.on('error', reject);
+        req.pipe(bb);
+    });
+}
+
+router.post('/upload-attachment', async (req, res) => {
+    try {
+        const { body, filename, mimeType } = await parseMultipartFile(req);
+        if (!body || body.length === 0) {
+            return res.status(400).json({ error: 'Empty file' });
+        }
+        // Sanitize filename and store under a per-upload uuid prefix
+        const safeName = String(filename).replace(/[^\w.\-]/g, '_').slice(0, 200) || 'attachment';
+        const uuid = crypto.randomUUID();
+        const key = `recruitment-rules/${uuid}/${safeName}`;
+        const url = await uploadFile('email-attachments', key, body, mimeType);
+
+        res.json({
+            url,
+            filename: filename,
+            mimeType,
+            size: body.length,
+        });
+    } catch (error) {
+        console.error('Recruitment attachment upload error:', error);
+        logErrorToSlack('error', {
+            category: 'recruitment',
+            action: 'attachment.upload_error',
+            message: error.message,
+            module: 'leads-attachment',
+        });
+        res.status(400).json({ error: error.message });
     }
 });
 
