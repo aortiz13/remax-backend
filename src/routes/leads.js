@@ -655,8 +655,8 @@ async function executeWhatsappRule(rule, candidate) {
     // Persist the log row first so we have an id to update from the worker.
     const { rows: logRows } = await pool.query(
         `INSERT INTO recruitment_whatsapp_logs
-            (candidate_id, template_id, ab_variant, body, to_phone, status, metadata)
-         VALUES ($1, $2, $3, $4, $5, 'queued', $6)
+            (candidate_id, template_id, ab_variant, body, to_phone, message_type, status, metadata)
+         VALUES ($1, $2, $3, $4, $5, 'outgoing', 'queued', $6)
          RETURNING id`,
         [
             candidate.id,
@@ -1098,8 +1098,8 @@ router.post('/candidates/:id/send-whatsapp', async (req, res) => {
 
         const { rows: logRows } = await pool.query(
             `INSERT INTO recruitment_whatsapp_logs
-                (candidate_id, template_id, body, to_phone, status, metadata)
-             VALUES ($1, $2, $3, $4, 'queued', $5)
+                (candidate_id, template_id, body, to_phone, message_type, status, metadata)
+             VALUES ($1, $2, $3, $4, 'outgoing', 'queued', $5)
              RETURNING id`,
             [
                 candidate.id,
