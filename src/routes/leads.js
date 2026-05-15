@@ -1062,6 +1062,31 @@ router.delete('/whatsapp-templates/:id', async (req, res) => {
 // Either templateId (renders from a stored template) or content (raw
 // text) is required.
 // ============================================================
+// ============================================================
+// Reset the cached Chatwoot ids on a candidate. Use this when the
+// stored chatwoot_conversation_id was created with the wrong
+// source_id format (pre-JID fix) and Evolution silently dropped the
+// outgoing messages. After resetting, the next send rebuilds the
+// contact + conversation with the correct JID source_id.
+// ============================================================
+router.post('/candidates/:id/reset-chatwoot-cache', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `UPDATE recruitment_candidates
+                SET chatwoot_contact_id      = NULL,
+                    chatwoot_conversation_id = NULL,
+                    updated_at = NOW()
+              WHERE id = $1
+              RETURNING id`,
+            [req.params.id],
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Candidate not found' });
+        res.json({ ok: true, candidateId: rows[0].id });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 router.post('/candidates/:id/send-whatsapp', async (req, res) => {
     try {
         const { templateId, content, attachments } = req.body || {};
