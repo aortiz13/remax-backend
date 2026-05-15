@@ -403,15 +403,42 @@ new Worker('recruitment-whatsapp', async (job) => {
 
         const result = await sendWhatsappToCandidate({ candidate, content, attachments });
 
+        // Surface the pre-send outcome so we can diagnose missing labels /
+        // custom attributes without re-running the send. Each "ok" means
+        // the corresponding side-effect succeeded; "-" means it wasn't
+        // configured; "NO" means it was configured but failed (see errors).
+        const ps = result.pre_send || {};
+        const status = (key, configured) => (ps[key] ? 'ok' : configured ? 'NO' : '-');
+        console.log(
+            `💬 [Recruitment WA] log=${logId} pre_send: ` +
+            `label=${status('labelApplied', !!process.env.CHATWOOT_LEAD_LABEL)} ` +
+            `contactAttr=${status('contactAttributeApplied', !!(process.env.CHATWOOT_LEAD_ATTRIBUTE_KEY && process.env.CHATWOOT_LEAD_ATTRIBUTE_VALUE))} ` +
+            `convAttr=${status('conversationAttributeApplied', !!process.env.CHATWOOT_AI_AGENT_ATTRIBUTE_KEY)} ` +
+            `errors=${(ps.errors || []).length}`,
+        );
+        if (result.pre_send?.errors?.length) {
+            for (const e of result.pre_send.errors) {
+                console.warn(`   pre_send.${e.step}: ${e.message}`);
+            }
+        }
+
         await pool.query(
             `UPDATE recruitment_whatsapp_logs
                 SET status                   = 'sent',
                     chatwoot_contact_id      = $1,
                     chatwoot_conversation_id = $2,
                     chatwoot_message_id      = $3,
+                    metadata                 = COALESCE(metadata, '{}'::jsonb)
+                                               || jsonb_build_object('pre_send', $5::jsonb),
                     sent_at                  = NOW()
               WHERE id = $4`,
-            [result.chatwoot_contact_id, result.chatwoot_conversation_id, result.chatwoot_message_id, logId],
+            [
+                result.chatwoot_contact_id,
+                result.chatwoot_conversation_id,
+                result.chatwoot_message_id,
+                logId,
+                JSON.stringify(result.pre_send || {}),
+            ],
         );
 
         // Timeline / activity_logs entry — the CLAUDE.md mandates it for every
