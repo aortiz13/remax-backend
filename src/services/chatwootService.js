@@ -20,16 +20,23 @@ const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN || '';
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || '';
 const CHATWOOT_INBOX_ID = process.env.CHATWOOT_INBOX_ID || '';
 
-// Label applied to the Chatwoot contact (slug — Chatwoot lowercases it
-// internally). Defaults to 'postulante' for the recruitment use-case.
-const CHATWOOT_LEAD_LABEL = (process.env.CHATWOOT_LEAD_LABEL || 'postulante').toLowerCase();
+// Optional: a Chatwoot Label (slug from Settings → Etiquetas) to add
+// to the contact. Leave empty if your "is a recruit" indicator is a
+// custom attribute instead.
+const CHATWOOT_LEAD_LABEL = (process.env.CHATWOOT_LEAD_LABEL || '').toLowerCase();
 
-// Conversation custom attribute (and value) used to disable an AI agent
-// before our message reaches the lead. The attribute_key must match the
-// one configured in Chatwoot → Settings → Custom Attributes (it's a slug,
-// not the display label). Default value is boolean `false`; override via
-// env if your setup uses a different attribute name or a string toggle.
-const CHATWOOT_AI_AGENT_ATTRIBUTE_KEY = process.env.CHATWOOT_AI_AGENT_ATTRIBUTE_KEY || 'agente_ia';
+// Contact-level custom attribute (e.g. attribute_key = "tipo" with
+// value "Postulante"). The attribute_key MUST match the slug from
+// Chatwoot → Settings → Atributos Personalizados, not the display
+// label. Leave either empty to skip.
+const CHATWOOT_LEAD_ATTRIBUTE_KEY = process.env.CHATWOOT_LEAD_ATTRIBUTE_KEY || '';
+const CHATWOOT_LEAD_ATTRIBUTE_VALUE = process.env.CHATWOOT_LEAD_ATTRIBUTE_VALUE || '';
+
+// Conversation-level custom attribute used to disable an AI agent
+// before our message reaches the lead (e.g. attribute_key = "ai"
+// with boolean false). Same rule as above: attribute_key is the
+// slug, not the display label.
+const CHATWOOT_AI_AGENT_ATTRIBUTE_KEY = process.env.CHATWOOT_AI_AGENT_ATTRIBUTE_KEY || '';
 const CHATWOOT_AI_AGENT_OFF_VALUE = (() => {
     const raw = process.env.CHATWOOT_AI_AGENT_OFF_VALUE;
     if (raw === undefined || raw === '') return false;
@@ -278,7 +285,7 @@ export async function addConversationLabels(conversationId, newLabels = []) {
     });
 }
 
-// Sets one or more custom_attributes on a conversation. Chatwoot stores
+// Sets one or more custom_attributes on a CONVERSATION. Chatwoot stores
 // them keyed by `attribute_key` (the slug from Settings → Custom Attributes,
 // not the display label). The POST replaces the matching keys; other
 // existing attributes are preserved server-side.
@@ -289,33 +296,77 @@ export async function setConversationCustomAttributes(conversationId, attrs) {
     });
 }
 
-// Convenience: apply our standard recruitment-flow pre-send state to a
-// (contact, conversation) pair. Tags the contact as "postulante" and
-// flips the AI-agent attribute off. Each call is wrapped in try/catch so
-// a label failure never blocks the message from being delivered.
-async function applyPreSendChatwootState({ contactId, conversationId }) {
-    const result = { labelApplied: false, attributeApplied: false, errors: [] };
+// Sets custom_attributes on a CONTACT. Chatwoot exposes this via the
+// general contact-update endpoint (PATCH /contacts/:id) — there's no
+// dedicated /custom_attributes endpoint for contacts in stable
+// versions. We read the existing attrs first and merge so we don't
+// blow away keys other automations may have set.
+async function getContact(contactId) {
+    const data = await cwFetch(`/contacts/${contactId}`);
+    return data?.payload || data;
+}
 
-    try {
-        if (CHATWOOT_LEAD_LABEL) {
+export async function setContactCustomAttributes(contactId, attrs) {
+    const contact = await getContact(contactId);
+    const existing = (contact && contact.custom_attributes) || {};
+    const merged = { ...existing, ...attrs };
+    return cwFetch(`/contacts/${contactId}`, {
+        method: 'PATCH',
+        body: { custom_attributes: merged },
+    });
+}
+
+// Convenience: apply our standard recruitment-flow pre-send state to a
+// (contact, conversation) pair. Up to 3 side-effects (any combination
+// configurable via env):
+//   1. (optional) Chatwoot label on the contact     CHATWOOT_LEAD_LABEL
+//   2. (optional) Custom attribute on the contact    CHATWOOT_LEAD_ATTRIBUTE_*
+//   3. (optional) Custom attribute on the conv.      CHATWOOT_AI_AGENT_*
+// Each side-effect is wrapped in try/catch so a single failure never
+// blocks the actual message from being delivered.
+async function applyPreSendChatwootState({ contactId, conversationId }) {
+    const result = {
+        labelApplied: false,
+        contactAttributeApplied: false,
+        conversationAttributeApplied: false,
+        errors: [],
+    };
+
+    // 1. Chatwoot label (Settings → Etiquetas slug)
+    if (CHATWOOT_LEAD_LABEL) {
+        try {
             await addContactLabels(contactId, [CHATWOOT_LEAD_LABEL]);
             result.labelApplied = true;
+        } catch (err) {
+            console.warn(`[Chatwoot] addContactLabels failed for contact ${contactId}: ${err.message}`);
+            result.errors.push({ step: 'contact_label', message: err.message });
         }
-    } catch (err) {
-        console.warn(`[Chatwoot] addContactLabels failed for contact ${contactId}: ${err.message}`);
-        result.errors.push({ step: 'contact_label', message: err.message });
     }
 
-    try {
-        if (CHATWOOT_AI_AGENT_ATTRIBUTE_KEY) {
+    // 2. Contact custom_attribute (e.g. tipo = Postulante)
+    if (CHATWOOT_LEAD_ATTRIBUTE_KEY && CHATWOOT_LEAD_ATTRIBUTE_VALUE !== '') {
+        try {
+            await setContactCustomAttributes(contactId, {
+                [CHATWOOT_LEAD_ATTRIBUTE_KEY]: CHATWOOT_LEAD_ATTRIBUTE_VALUE,
+            });
+            result.contactAttributeApplied = true;
+        } catch (err) {
+            console.warn(`[Chatwoot] setContactCustomAttributes failed for contact ${contactId}: ${err.message}`);
+            result.errors.push({ step: 'contact_attribute', message: err.message });
+        }
+    }
+
+    // 3. Conversation custom_attribute (e.g. ai = false)
+    if (CHATWOOT_AI_AGENT_ATTRIBUTE_KEY) {
+        try {
             await setConversationCustomAttributes(conversationId, {
                 [CHATWOOT_AI_AGENT_ATTRIBUTE_KEY]: CHATWOOT_AI_AGENT_OFF_VALUE,
             });
-            result.attributeApplied = true;
+            result.conversationAttributeApplied = true;
+        } catch (err) {
+            console.warn(`[Chatwoot] setConversationCustomAttributes failed for conv ${conversationId}: ${err.message}`);
+            result.errors.push({ step: 'conversation_attribute', message: err.message });
         }
-    } catch (err) {
-        console.warn(`[Chatwoot] setConversationCustomAttributes failed for conv ${conversationId}: ${err.message}`);
-        result.errors.push({ step: 'conversation_attribute', message: err.message });
     }
 
     return result;
