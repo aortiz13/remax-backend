@@ -4,7 +4,7 @@ import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import { recruitmentEmailQueue, recruitmentWhatsappQueue } from '../queues/index.js';
 import { uploadFile } from '../lib/storage.js';
 import { resolveCalendarEventVars } from '../lib/calendarVariables.js';
-import { isChatwootConfigured, getChatwootPublicConfig } from '../services/chatwootService.js';
+import { isChatwootConfigured, getChatwootPublicConfig, fetchConversationMessages } from '../services/chatwootService.js';
 import Busboy from 'busboy';
 import crypto from 'crypto';
 
@@ -1062,6 +1062,106 @@ router.delete('/whatsapp-templates/:id', async (req, res) => {
 // Either templateId (renders from a stored template) or content (raw
 // text) is required.
 // ============================================================
+// ============================================================
+// Full WhatsApp conversation history for a candidate. Pulls messages
+// from Chatwoot when we have a cached chatwoot_conversation_id; falls
+// back to the local recruitment_whatsapp_logs (outgoing-only) when
+// Chatwoot doesn't know the conversation (deleted, never created,
+// or env not configured).
+//
+// Returns: { source: 'chatwoot'|'local'|'none', messages: [...] }
+//   message shape: {
+//     id, direction: 'incoming'|'outgoing', content,
+//     created_at, sender_name, attachments: [{file_type, url, ...}]
+//   }
+// ============================================================
+router.get('/candidates/:id/whatsapp-history', async (req, res) => {
+    try {
+        const { rows } = await pool.query(
+            `SELECT id, first_name, last_name, chatwoot_conversation_id
+               FROM recruitment_candidates WHERE id = $1`,
+            [req.params.id],
+        );
+        if (!rows.length) return res.status(404).json({ error: 'Candidate not found' });
+        const candidate = rows[0];
+
+        const fallbackToLocal = async (note) => {
+            const { rows: logs } = await pool.query(
+                `SELECT id, body, to_phone, status, sent_at, metadata
+                   FROM recruitment_whatsapp_logs
+                  WHERE candidate_id = $1
+                  ORDER BY sent_at ASC`,
+                [req.params.id],
+            );
+            return res.json({
+                source: 'local',
+                note: note || null,
+                messages: logs.map(l => ({
+                    id: `local-${l.id}`,
+                    direction: 'outgoing',
+                    content: l.body || '',
+                    created_at: l.sent_at,
+                    sender_name: 'Equipo RE/MAX',
+                    status: l.status,
+                    attachments: [],
+                })),
+            });
+        };
+
+        if (!candidate.chatwoot_conversation_id) {
+            return fallbackToLocal('Sin conversación de Chatwoot vinculada');
+        }
+        if (!isChatwootConfigured()) {
+            return fallbackToLocal('Chatwoot env no configurado');
+        }
+
+        try {
+            const raw = await fetchConversationMessages(candidate.chatwoot_conversation_id);
+            const messages = raw
+                .map(m => {
+                    // Chatwoot message_type: 0 incoming, 1 outgoing, 2 activity, 3 template
+                    const mt = m.message_type;
+                    const isOutgoing = mt === 1 || mt === 'outgoing' || mt === 'template';
+                    const isActivity = mt === 2 || mt === 'activity';
+                    if (isActivity) return null; // skip system events
+                    const senderName = m.sender?.name
+                        || (isOutgoing
+                            ? 'Equipo RE/MAX'
+                            : `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato');
+                    return {
+                        id: `cw-${m.id}`,
+                        direction: isOutgoing ? 'outgoing' : 'incoming',
+                        content: m.content || '',
+                        created_at: m.created_at ? new Date(m.created_at * 1000).toISOString() : null,
+                        sender_name: senderName,
+                        sender_type: m.sender?.type || null,
+                        attachments: (m.attachments || []).map(a => ({
+                            id: a.id,
+                            file_type: a.file_type,
+                            url: a.data_url,
+                            thumb_url: a.thumb_url,
+                            file_size: a.file_size,
+                        })),
+                    };
+                })
+                .filter(Boolean)
+                .sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
+            res.json({ source: 'chatwoot', messages });
+        } catch (err) {
+            if (err?.status === 404) {
+                return fallbackToLocal('Conversación de Chatwoot no encontrada (eliminada o nunca creada)');
+            }
+            throw err;
+        }
+    } catch (err) {
+        logErrorToSlack('error', {
+            category: 'recruitment', action: 'whatsapp.history_error',
+            message: err.message, module: 'leads-whatsapp-history',
+        });
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ============================================================
 // Reset the cached Chatwoot ids on a candidate. Use this when the
 // stored chatwoot_conversation_id was created with the wrong
