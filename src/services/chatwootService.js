@@ -394,34 +394,54 @@ export async function sendMessageWithAttachments({ conversationId, content, atta
 // If `attachments` has items, the message is sent multipart and they
 // are uploaded as Chatwoot attachments[] (which Chatwoot then forwards
 // to WhatsApp as media).
-export async function sendWhatsappToCandidate({ candidate, content, attachments = [] }) {
-    const contact = await findOrCreateContact({
-        candidateId: candidate.id,
-        name: `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato',
-        email: candidate.email || null,
-        phone: candidate.whatsapp || candidate.phone || null,
-    });
-    const phoneE164 = normalizePhone(candidate.whatsapp || candidate.phone);
-    const conversation = await findOrCreateConversation({
-        candidateId: candidate.id,
-        contactId: contact.id,
-        phoneE164,
-    });
+export async function sendWhatsappToCandidate({ candidate, content, attachments = [], _selfHealAttempted = false }) {
+    try {
+        const contact = await findOrCreateContact({
+            candidateId: candidate.id,
+            name: `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato',
+            email: candidate.email || null,
+            phone: candidate.whatsapp || candidate.phone || null,
+        });
+        const phoneE164 = normalizePhone(candidate.whatsapp || candidate.phone);
+        const conversation = await findOrCreateConversation({
+            candidateId: candidate.id,
+            contactId: contact.id,
+            phoneE164,
+        });
 
-    // Pre-send: tag contact as "postulante" and disable any AI agent on
-    // the conversation. Failures here are logged but never block the send.
-    const preSend = await applyPreSendChatwootState({
-        contactId: contact.id,
-        conversationId: conversation.id,
-    });
+        // Pre-send: tag contact as "postulante" and disable any AI agent on
+        // the conversation. Failures here are logged but never block the send.
+        const preSend = await applyPreSendChatwootState({
+            contactId: contact.id,
+            conversationId: conversation.id,
+        });
 
-    const message = attachments?.length
-        ? await sendMessageWithAttachments({ conversationId: conversation.id, content, attachments })
-        : await sendMessage({ conversationId: conversation.id, content });
-    return {
-        chatwoot_contact_id: contact.id,
-        chatwoot_conversation_id: conversation.id,
-        chatwoot_message_id: message?.id || message?.payload?.id || null,
-        pre_send: preSend,
-    };
+        const message = attachments?.length
+            ? await sendMessageWithAttachments({ conversationId: conversation.id, content, attachments })
+            : await sendMessage({ conversationId: conversation.id, content });
+        return {
+            chatwoot_contact_id: contact.id,
+            chatwoot_conversation_id: conversation.id,
+            chatwoot_message_id: message?.id || message?.payload?.id || null,
+            pre_send: preSend,
+        };
+    } catch (err) {
+        // Self-heal: if the cached chatwoot_* ids point to a contact or
+        // conversation that no longer exists in Chatwoot (e.g. someone
+        // deleted them from the UI), we hit a 404 here. Clear the cache
+        // and retry once with a fresh contact+conversation.
+        if (err?.status === 404 && !_selfHealAttempted && candidate?.id) {
+            console.warn(`[Chatwoot] 404 sending to candidate ${candidate.id}; clearing cached ids and retrying once`);
+            await pool.query(
+                `UPDATE recruitment_candidates
+                    SET chatwoot_contact_id      = NULL,
+                        chatwoot_conversation_id = NULL,
+                        updated_at = NOW()
+                  WHERE id = $1`,
+                [candidate.id],
+            );
+            return sendWhatsappToCandidate({ candidate, content, attachments, _selfHealAttempted: true });
+        }
+        throw err;
+    }
 }
