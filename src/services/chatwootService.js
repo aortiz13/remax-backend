@@ -46,6 +46,16 @@ const CHATWOOT_AI_AGENT_OFF_VALUE = (() => {
     return raw;
 })();
 
+// Default Chatwoot agent the conversation gets assigned to before we
+// send the first outgoing message. Numeric Chatwoot user id (e.g. 4
+// for rrss@remax-exclusive.cl). Empty = don't assign.
+const CHATWOOT_DEFAULT_ASSIGNEE_ID = (() => {
+    const raw = process.env.CHATWOOT_DEFAULT_ASSIGNEE_ID;
+    if (!raw) return null;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : null;
+})();
+
 export function getChatwootPublicConfig() {
     return {
         baseUrl: CHATWOOT_API_URL,
@@ -319,12 +329,23 @@ export async function setContactCustomAttributes(contactId, attrs) {
     });
 }
 
+// Assigns a Chatwoot agent (user) to the conversation. Uses the
+// dedicated /assignments endpoint, which is what the Chatwoot UI uses
+// when you change the "Agente asignado" dropdown.
+export async function assignConversationAgent(conversationId, assigneeId) {
+    return cwFetch(`/conversations/${conversationId}/assignments`, {
+        method: 'POST',
+        body: { assignee_id: Number(assigneeId) },
+    });
+}
+
 // Convenience: apply our standard recruitment-flow pre-send state to a
-// (contact, conversation) pair. Up to 3 side-effects (any combination
+// (contact, conversation) pair. Up to 4 side-effects (any combination
 // configurable via env):
 //   1. (optional) Chatwoot label on the contact     CHATWOOT_LEAD_LABEL
 //   2. (optional) Custom attribute on the contact    CHATWOOT_LEAD_ATTRIBUTE_*
 //   3. (optional) Custom attribute on the conv.      CHATWOOT_AI_AGENT_*
+//   4. (optional) Assign conv. to an agent           CHATWOOT_DEFAULT_ASSIGNEE_ID
 // Each side-effect is wrapped in try/catch so a single failure never
 // blocks the actual message from being delivered.
 async function applyPreSendChatwootState({ contactId, conversationId }) {
@@ -332,6 +353,7 @@ async function applyPreSendChatwootState({ contactId, conversationId }) {
         labelApplied: false,
         contactAttributeApplied: false,
         conversationAttributeApplied: false,
+        assigneeApplied: false,
         errors: [],
     };
 
@@ -359,7 +381,7 @@ async function applyPreSendChatwootState({ contactId, conversationId }) {
         }
     }
 
-    // 3. Conversation custom_attribute (e.g. ai = false)
+    // 3. Conversation custom_attribute (e.g. ai = OFF)
     if (CHATWOOT_AI_AGENT_ATTRIBUTE_KEY) {
         try {
             await setConversationCustomAttributes(conversationId, {
@@ -369,6 +391,17 @@ async function applyPreSendChatwootState({ contactId, conversationId }) {
         } catch (err) {
             console.warn(`[Chatwoot] setConversationCustomAttributes failed for conv ${conversationId}: ${err.message}`);
             result.errors.push({ step: 'conversation_attribute', message: err.message });
+        }
+    }
+
+    // 4. Assign conversation to a Chatwoot agent (e.g. rrss user, id 4)
+    if (CHATWOOT_DEFAULT_ASSIGNEE_ID) {
+        try {
+            await assignConversationAgent(conversationId, CHATWOOT_DEFAULT_ASSIGNEE_ID);
+            result.assigneeApplied = true;
+        } catch (err) {
+            console.warn(`[Chatwoot] assignConversationAgent failed for conv ${conversationId} → assignee ${CHATWOOT_DEFAULT_ASSIGNEE_ID}: ${err.message}`);
+            result.errors.push({ step: 'conversation_assignee', message: err.message });
         }
     }
 

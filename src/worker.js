@@ -414,6 +414,7 @@ new Worker('recruitment-whatsapp', async (job) => {
             `label=${status('labelApplied', !!process.env.CHATWOOT_LEAD_LABEL)} ` +
             `contactAttr=${status('contactAttributeApplied', !!(process.env.CHATWOOT_LEAD_ATTRIBUTE_KEY && process.env.CHATWOOT_LEAD_ATTRIBUTE_VALUE))} ` +
             `convAttr=${status('conversationAttributeApplied', !!process.env.CHATWOOT_AI_AGENT_ATTRIBUTE_KEY)} ` +
+            `assignee=${status('assigneeApplied', !!process.env.CHATWOOT_DEFAULT_ASSIGNEE_ID)} ` +
             `errors=${(ps.errors || []).length}`,
         );
         if (result.pre_send?.errors?.length) {
