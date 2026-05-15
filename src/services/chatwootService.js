@@ -101,6 +101,19 @@ export function normalizePhone(raw) {
     return `+${digits}`;
 }
 
+// WhatsApp JID — the format Evolution API uses internally as the
+// `source_id` of a conversation and the `identifier` of a contact
+// (e.g. "59892206700@s.whatsapp.net"). When we create resources via
+// the Chatwoot API we MUST use this format, otherwise Evolution
+// doesn't recognise them as its own and never forwards outgoing
+// messages to WhatsApp.
+export function phoneToJid(phoneOrE164) {
+    if (!phoneOrE164) return null;
+    const digits = String(phoneOrE164).replace(/\D/g, '');
+    if (!digits) return null;
+    return `${digits}@s.whatsapp.net`;
+}
+
 // ─── Contacts ─────────────────────────────────────────────────────
 async function searchContactByPhone(phoneE164) {
     // Chatwoot exposes /contacts/search with a `q` param. The phone is the
@@ -115,6 +128,9 @@ async function createContact({ name, email, phoneE164 }) {
         inbox_id: Number(CHATWOOT_INBOX_ID),
         name: name || 'Candidato RE/MAX',
         phone_number: phoneE164,
+        // Identifier in WhatsApp JID format so Evolution API can
+        // correlate the contact with its WhatsApp instance.
+        identifier: phoneToJid(phoneE164),
     };
     if (email) body.email = email;
     const data = await cwFetch('/contacts', { method: 'POST', body });
@@ -167,7 +183,12 @@ async function listConversationsForContact(contactId) {
 
 async function createConversation({ contactId, sourceId }) {
     const body = {
-        source_id: sourceId,                 // contact_inbox source_id (phone for WA)
+        // source_id must be the WhatsApp JID (e.g. 5691XXXXXXXX@s.whatsapp.net)
+        // so Evolution API recognises the conversation as its own and
+        // forwards outgoing messages to WhatsApp. Passing the bare phone
+        // (+E.164) silently breaks delivery — Chatwoot accepts it and
+        // shows ✓✓ in the UI but Evolution drops the message.
+        source_id: sourceId,
         inbox_id: Number(CHATWOOT_INBOX_ID),
         contact_id: Number(contactId),
         status: 'open',
@@ -196,7 +217,9 @@ export async function findOrCreateConversation({ candidateId, contactId, phoneE1
 
     // 3. Otherwise create a brand new one
     if (!conv) {
-        conv = await createConversation({ contactId, sourceId: phoneE164 });
+        // Evolution expects the JID form (<digits>@s.whatsapp.net), NOT
+        // the bare +E.164 — see the comment in createConversation().
+        conv = await createConversation({ contactId, sourceId: phoneToJid(phoneE164) });
     }
 
     const convId = conv?.id;
