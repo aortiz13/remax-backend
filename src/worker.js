@@ -403,15 +403,35 @@ new Worker('recruitment-whatsapp', async (job) => {
 
         const result = await sendWhatsappToCandidate({ candidate, content, attachments });
 
+        // Surface the pre-send outcome so we can diagnose missing labels /
+        // custom attributes without re-running the send. The result has
+        // shape { labelApplied, attributeApplied, errors: [...] }.
+        console.log(
+            `💬 [Recruitment WA] log=${logId} pre_send: label=${result.pre_send?.labelApplied ? 'ok' : 'NO'} attr=${result.pre_send?.attributeApplied ? 'ok' : 'NO'} errors=${(result.pre_send?.errors || []).length}`,
+        );
+        if (result.pre_send?.errors?.length) {
+            for (const e of result.pre_send.errors) {
+                console.warn(`   pre_send.${e.step}: ${e.message}`);
+            }
+        }
+
         await pool.query(
             `UPDATE recruitment_whatsapp_logs
                 SET status                   = 'sent',
                     chatwoot_contact_id      = $1,
                     chatwoot_conversation_id = $2,
                     chatwoot_message_id      = $3,
+                    metadata                 = COALESCE(metadata, '{}'::jsonb)
+                                               || jsonb_build_object('pre_send', $5::jsonb),
                     sent_at                  = NOW()
               WHERE id = $4`,
-            [result.chatwoot_contact_id, result.chatwoot_conversation_id, result.chatwoot_message_id, logId],
+            [
+                result.chatwoot_contact_id,
+                result.chatwoot_conversation_id,
+                result.chatwoot_message_id,
+                logId,
+                JSON.stringify(result.pre_send || {}),
+            ],
         );
 
         // Timeline / activity_logs entry — the CLAUDE.md mandates it for every
