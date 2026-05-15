@@ -310,8 +310,11 @@ export async function setContactCustomAttributes(contactId, attrs) {
     const contact = await getContact(contactId);
     const existing = (contact && contact.custom_attributes) || {};
     const merged = { ...existing, ...attrs };
+    // PUT — same verb the n8n "Etiqueta" node uses against this endpoint.
+    // Chatwoot accepts both PUT and PATCH; we stick to PUT to mirror the
+    // known-working production call exactly.
     return cwFetch(`/contacts/${contactId}`, {
-        method: 'PATCH',
+        method: 'PUT',
         body: { custom_attributes: merged },
     });
 }
