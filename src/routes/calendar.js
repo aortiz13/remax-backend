@@ -30,11 +30,33 @@ async function getAccessToken(refreshToken) {
     return data.access_token;
 }
 
+const PRIVILEGED_CALENDAR_ROLES = ['admin', 'superadministrador', 'comercial', 'legal', 'tecnico'];
+
 // POST /api/calendar/sync — Sync calendar events
 router.post('/sync', authMiddleware, async (req, res) => {
     try {
         const { action, reset, agentId: bodyAgentId, taskId, googleEventId, create_meet } = req.body;
-        const agentId = req.isServiceCall ? bodyAgentId : req.user.id;
+
+        // Resolve the calendar owner to operate on:
+        // - service-role internal calls trust the body's agentId
+        // - admin/staff users may act on behalf of another agent (e.g. approving a
+        //   shift pushes the event to the assigned agent's / comercial's calendar)
+        // - regular users can only act on their own calendar
+        let agentId;
+        if (req.isServiceCall) {
+            agentId = bodyAgentId;
+        } else if (bodyAgentId && bodyAgentId !== req.user.id) {
+            const { data: callerProfile } = await supabaseAdmin
+                .from('profiles')
+                .select('role')
+                .eq('id', req.user.id)
+                .single();
+            agentId = callerProfile && PRIVILEGED_CALENDAR_ROLES.includes(callerProfile.role)
+                ? bodyAgentId
+                : req.user.id;
+        } else {
+            agentId = req.user.id;
+        }
 
         if (!agentId) {
             return res.status(400).json({ error: 'Missing agentId' });
