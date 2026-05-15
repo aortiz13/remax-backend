@@ -339,6 +339,16 @@ export async function assignConversationAgent(conversationId, assigneeId) {
     });
 }
 
+// Fetches the full message history of a Chatwoot conversation. Returns
+// the raw payload array (most-recent-first in Chatwoot's API) — caller
+// is responsible for sorting and mapping fields. Throws an Error with
+// .status=404 when the conversation no longer exists.
+export async function fetchConversationMessages(conversationId) {
+    const data = await cwFetch(`/conversations/${conversationId}/messages`);
+    const payload = data?.payload || data?.data?.payload || data || [];
+    return Array.isArray(payload) ? payload : [];
+}
+
 // Convenience: apply our standard recruitment-flow pre-send state to a
 // (contact, conversation) pair. Up to 4 side-effects (any combination
 // configurable via env):
