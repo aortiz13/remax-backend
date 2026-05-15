@@ -387,8 +387,8 @@ new Worker('recruitment-email', async (job) => {
 //   4. mark recruitment_whatsapp_logs row as 'sent' (or 'failed')
 // =============================================
 new Worker('recruitment-whatsapp', async (job) => {
-    const { logId, candidateId, content } = job.data;
-    console.log(`💬 [Recruitment WA] Sending log=${logId} candidate=${candidateId}...`);
+    const { logId, candidateId, content, attachments = [] } = job.data;
+    console.log(`💬 [Recruitment WA] Sending log=${logId} candidate=${candidateId} attachments=${attachments.length}...`);
 
     try {
         const { sendWhatsappToCandidate } = await import('./services/chatwootService.js');
@@ -401,7 +401,7 @@ new Worker('recruitment-whatsapp', async (job) => {
         const candidate = rows[0];
         if (!candidate) throw new Error(`Candidate ${candidateId} not found`);
 
-        const result = await sendWhatsappToCandidate({ candidate, content });
+        const result = await sendWhatsappToCandidate({ candidate, content, attachments });
 
         await pool.query(
             `UPDATE recruitment_whatsapp_logs

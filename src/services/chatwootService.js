@@ -20,6 +20,33 @@ const CHATWOOT_API_TOKEN = process.env.CHATWOOT_API_TOKEN || '';
 const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || '';
 const CHATWOOT_INBOX_ID = process.env.CHATWOOT_INBOX_ID || '';
 
+// Label applied to the Chatwoot contact (slug — Chatwoot lowercases it
+// internally). Defaults to 'postulante' for the recruitment use-case.
+const CHATWOOT_LEAD_LABEL = (process.env.CHATWOOT_LEAD_LABEL || 'postulante').toLowerCase();
+
+// Conversation custom attribute (and value) used to disable an AI agent
+// before our message reaches the lead. The attribute_key must match the
+// one configured in Chatwoot → Settings → Custom Attributes (it's a slug,
+// not the display label). Default value is boolean `false`; override via
+// env if your setup uses a different attribute name or a string toggle.
+const CHATWOOT_AI_AGENT_ATTRIBUTE_KEY = process.env.CHATWOOT_AI_AGENT_ATTRIBUTE_KEY || 'agente_ia';
+const CHATWOOT_AI_AGENT_OFF_VALUE = (() => {
+    const raw = process.env.CHATWOOT_AI_AGENT_OFF_VALUE;
+    if (raw === undefined || raw === '') return false;
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+    // Accept a literal string like "off" if the attribute is a select
+    return raw;
+})();
+
+export function getChatwootPublicConfig() {
+    return {
+        baseUrl: CHATWOOT_API_URL,
+        accountId: CHATWOOT_ACCOUNT_ID ? Number(CHATWOOT_ACCOUNT_ID) : null,
+        inboxId: CHATWOOT_INBOX_ID ? Number(CHATWOOT_INBOX_ID) : null,
+    };
+}
+
 export function isChatwootConfigured() {
     return Boolean(
         CHATWOOT_API_URL &&
@@ -184,6 +211,93 @@ export async function findOrCreateConversation({ candidateId, contactId, phoneE1
     return { id: convId, cached: false };
 }
 
+// ─── Labels & custom attributes ──────────────────────────────────
+// `addContactLabels` and `addConversationLabels` POST a list of label
+// slugs to the contact/conversation. Chatwoot's API replaces the full
+// list, so we read what's there and union our label in to avoid
+// stomping existing tags.
+
+async function getContactLabels(contactId) {
+    try {
+        const data = await cwFetch(`/contacts/${contactId}/labels`);
+        const labels = data?.payload || data?.data || data || [];
+        return Array.isArray(labels) ? labels : [];
+    } catch {
+        return [];
+    }
+}
+
+export async function addContactLabels(contactId, newLabels = []) {
+    const existing = await getContactLabels(contactId);
+    const merged = Array.from(new Set([...existing, ...newLabels.filter(Boolean)]));
+    return cwFetch(`/contacts/${contactId}/labels`, {
+        method: 'POST',
+        body: { labels: merged },
+    });
+}
+
+async function getConversationLabels(conversationId) {
+    try {
+        const data = await cwFetch(`/conversations/${conversationId}/labels`);
+        const labels = data?.payload || data?.data || data || [];
+        return Array.isArray(labels) ? labels : [];
+    } catch {
+        return [];
+    }
+}
+
+export async function addConversationLabels(conversationId, newLabels = []) {
+    const existing = await getConversationLabels(conversationId);
+    const merged = Array.from(new Set([...existing, ...newLabels.filter(Boolean)]));
+    return cwFetch(`/conversations/${conversationId}/labels`, {
+        method: 'POST',
+        body: { labels: merged },
+    });
+}
+
+// Sets one or more custom_attributes on a conversation. Chatwoot stores
+// them keyed by `attribute_key` (the slug from Settings → Custom Attributes,
+// not the display label). The POST replaces the matching keys; other
+// existing attributes are preserved server-side.
+export async function setConversationCustomAttributes(conversationId, attrs) {
+    return cwFetch(`/conversations/${conversationId}/custom_attributes`, {
+        method: 'POST',
+        body: { custom_attributes: attrs },
+    });
+}
+
+// Convenience: apply our standard recruitment-flow pre-send state to a
+// (contact, conversation) pair. Tags the contact as "postulante" and
+// flips the AI-agent attribute off. Each call is wrapped in try/catch so
+// a label failure never blocks the message from being delivered.
+async function applyPreSendChatwootState({ contactId, conversationId }) {
+    const result = { labelApplied: false, attributeApplied: false, errors: [] };
+
+    try {
+        if (CHATWOOT_LEAD_LABEL) {
+            await addContactLabels(contactId, [CHATWOOT_LEAD_LABEL]);
+            result.labelApplied = true;
+        }
+    } catch (err) {
+        console.warn(`[Chatwoot] addContactLabels failed for contact ${contactId}: ${err.message}`);
+        result.errors.push({ step: 'contact_label', message: err.message });
+    }
+
+    try {
+        if (CHATWOOT_AI_AGENT_ATTRIBUTE_KEY) {
+            await setConversationCustomAttributes(conversationId, {
+                [CHATWOOT_AI_AGENT_ATTRIBUTE_KEY]: CHATWOOT_AI_AGENT_OFF_VALUE,
+            });
+            result.attributeApplied = true;
+        }
+    } catch (err) {
+        console.warn(`[Chatwoot] setConversationCustomAttributes failed for conv ${conversationId}: ${err.message}`);
+        result.errors.push({ step: 'conversation_attribute', message: err.message });
+    }
+
+    return result;
+}
+
 // ─── Send message ─────────────────────────────────────────────────
 export async function sendMessage({ conversationId, content }) {
     const data = await cwFetch(`/conversations/${conversationId}/messages`, {
@@ -198,10 +312,66 @@ export async function sendMessage({ conversationId, content }) {
     return data;
 }
 
+// ─── Send message with binary attachments ────────────────────────
+// Chatwoot accepts attachments only via multipart/form-data. We
+// download each attachment URL ourselves and forward the bytes as
+// attachments[]. The api_access_token header stays the same; we MUST
+// NOT set Content-Type — FormData adds the boundary.
+//
+// `attachments` shape: [{ url, filename, mimeType, size? }, ...]
+// `downloader` is optional (defaults to fetch) — useful for tests.
+//
+// WhatsApp Business per-file limits (enforced by Meta, not us):
+//   video / audio: 16 MB | image: 5 MB | document: 100 MB
+export async function sendMessageWithAttachments({ conversationId, content, attachments = [], downloader = fetch }) {
+    if (!attachments.length) {
+        return sendMessage({ conversationId, content });
+    }
+    requireConfig();
+    const url = `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`;
+
+    const form = new FormData();
+    form.append('content', content || '');
+    form.append('message_type', 'outgoing');
+    form.append('private', 'false');
+    // No content_type field — Chatwoot infers from the file mimeType.
+
+    for (const att of attachments) {
+        if (!att?.url) continue;
+        const r = await downloader(att.url);
+        if (!r.ok) throw new Error(`Attachment download failed (${r.status}) for ${att.url}`);
+        const buf = Buffer.from(await r.arrayBuffer());
+        const mime = att.mimeType || r.headers.get('content-type') || 'application/octet-stream';
+        const blob = new Blob([buf], { type: mime });
+        const name = att.filename || att.url.split('/').pop() || 'attachment';
+        form.append('attachments[]', blob, name);
+    }
+
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: { api_access_token: CHATWOOT_API_TOKEN },
+        body: form,
+    });
+    const text = await resp.text();
+    let json;
+    try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+    if (!resp.ok) {
+        const err = new Error(`Chatwoot POST messages (multipart) → ${resp.status}: ${text.slice(0, 400)}`);
+        err.status = resp.status;
+        err.body = json;
+        throw err;
+    }
+    return json;
+}
+
 // ─── End-to-end helper ────────────────────────────────────────────
 // Used both by the BullMQ worker (recruitment automation) and by any
 // future ad-hoc endpoint that wants to "just send a WhatsApp".
-export async function sendWhatsappToCandidate({ candidate, content }) {
+//
+// If `attachments` has items, the message is sent multipart and they
+// are uploaded as Chatwoot attachments[] (which Chatwoot then forwards
+// to WhatsApp as media).
+export async function sendWhatsappToCandidate({ candidate, content, attachments = [] }) {
     const contact = await findOrCreateContact({
         candidateId: candidate.id,
         name: `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato',
@@ -214,10 +384,21 @@ export async function sendWhatsappToCandidate({ candidate, content }) {
         contactId: contact.id,
         phoneE164,
     });
-    const message = await sendMessage({ conversationId: conversation.id, content });
+
+    // Pre-send: tag contact as "postulante" and disable any AI agent on
+    // the conversation. Failures here are logged but never block the send.
+    const preSend = await applyPreSendChatwootState({
+        contactId: contact.id,
+        conversationId: conversation.id,
+    });
+
+    const message = attachments?.length
+        ? await sendMessageWithAttachments({ conversationId: conversation.id, content, attachments })
+        : await sendMessage({ conversationId: conversation.id, content });
     return {
         chatwoot_contact_id: contact.id,
         chatwoot_conversation_id: conversation.id,
         chatwoot_message_id: message?.id || message?.payload?.id || null,
+        pre_send: preSend,
     };
 }
