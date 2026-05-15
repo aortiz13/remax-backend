@@ -4,7 +4,7 @@ import { logErrorToSlack } from '../middleware/slackErrorLogger.js';
 import { recruitmentEmailQueue, recruitmentWhatsappQueue } from '../queues/index.js';
 import { uploadFile } from '../lib/storage.js';
 import { resolveCalendarEventVars } from '../lib/calendarVariables.js';
-import { isChatwootConfigured } from '../services/chatwootService.js';
+import { isChatwootConfigured, getChatwootPublicConfig } from '../services/chatwootService.js';
 import Busboy from 'busboy';
 import crypto from 'crypto';
 
@@ -948,6 +948,16 @@ router.post('/templates/ai-generate', async (req, res) => {
         });
         res.status(500).json({ error: error.message });
     }
+});
+
+// ============================================================
+// Chatwoot public config — base URL + account_id + inbox_id, so the
+// frontend can build "Abrir chat" links without duplicating env vars.
+// Safe to expose: these values are already visible to anyone who opens
+// the Chatwoot widget (ChatwootWidget.jsx hardcodes the same baseUrl).
+// ============================================================
+router.get('/chatwoot-config', (_req, res) => {
+    res.json(getChatwootPublicConfig());
 });
 
 // ============================================================
