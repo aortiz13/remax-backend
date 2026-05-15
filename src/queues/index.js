@@ -6,6 +6,7 @@ const defaultOpts = { connection: redisConnection };
 export const emailQueue = new Queue('email', defaultOpts);
 export const emailQueueEvents = new QueueEvents('email', { connection: redisConnection });
 export const recruitmentEmailQueue = new Queue('recruitment-email', defaultOpts);
+export const recruitmentWhatsappQueue = new Queue('recruitment-whatsapp', defaultOpts);
 export const calendarQueue = new Queue('calendar', defaultOpts);
 export const importQueue = new Queue('import', defaultOpts);
 export const notificationQueue = new Queue('notification', defaultOpts);
