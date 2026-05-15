@@ -640,7 +640,7 @@ async function executeWhatsappRule(rule, candidate) {
     if (!templateId) throw new Error(`Rule ${rule.id} has no whatsapp_template_id`);
 
     const { rows: tplRows } = await pool.query(
-        `SELECT id, body FROM recruitment_whatsapp_templates WHERE id = $1`,
+        `SELECT id, body, attachments_json FROM recruitment_whatsapp_templates WHERE id = $1`,
         [templateId],
     );
     if (!tplRows.length) throw new Error(`WhatsApp template ${templateId} not found`);
@@ -649,6 +649,8 @@ async function executeWhatsappRule(rule, candidate) {
     const vars = buildTemplateVars(candidate);
     let body = renderTemplateVars(tpl.body, vars);
     body = await resolveCalendarEventVars(body);
+
+    const attachments = Array.isArray(tpl.attachments_json) ? tpl.attachments_json : [];
 
     // Persist the log row first so we have an id to update from the worker.
     const { rows: logRows } = await pool.query(
@@ -662,14 +664,14 @@ async function executeWhatsappRule(rule, candidate) {
             abVariant,
             body,
             phone,
-            JSON.stringify({ rule_id: rule.id, trigger: 'automation_rule' }),
+            JSON.stringify({ rule_id: rule.id, trigger: 'automation_rule', attachments_count: attachments.length }),
         ],
     );
     const logId = logRows[0].id;
 
     await recruitmentWhatsappQueue.add(
         'send-recruitment-whatsapp',
-        { logId, candidateId: candidate.id, content: body },
+        { logId, candidateId: candidate.id, content: body, attachments },
         {
             attempts: 3,
             backoff: { type: 'exponential', delay: 5000 },
@@ -956,7 +958,7 @@ router.post('/templates/ai-generate', async (req, res) => {
 router.get('/whatsapp-templates', async (_req, res) => {
     try {
         const { rows } = await pool.query(
-            `SELECT id, name, body, category, is_default, created_by, created_at, updated_at
+            `SELECT id, name, body, category, is_default, attachments_json, created_by, created_at, updated_at
                FROM recruitment_whatsapp_templates
               ORDER BY is_default DESC NULLS LAST, name ASC`,
         );
@@ -969,7 +971,7 @@ router.get('/whatsapp-templates', async (_req, res) => {
 router.get('/whatsapp-templates/:id', async (req, res) => {
     try {
         const { rows } = await pool.query(
-            `SELECT id, name, body, category, is_default, created_by, created_at, updated_at
+            `SELECT id, name, body, category, is_default, attachments_json, created_by, created_at, updated_at
                FROM recruitment_whatsapp_templates WHERE id = $1`,
             [req.params.id],
         );
@@ -982,13 +984,20 @@ router.get('/whatsapp-templates/:id', async (req, res) => {
 
 router.post('/whatsapp-templates', async (req, res) => {
     try {
-        const { name, body, category, is_default, created_by } = req.body || {};
+        const { name, body, category, is_default, attachments_json, created_by } = req.body || {};
         if (!name || !body) return res.status(400).json({ error: 'name and body are required' });
         const { rows } = await pool.query(
-            `INSERT INTO recruitment_whatsapp_templates (name, body, category, is_default, created_by)
-             VALUES ($1, $2, COALESCE($3, 'General'), COALESCE($4, false), $5)
+            `INSERT INTO recruitment_whatsapp_templates (name, body, category, is_default, attachments_json, created_by)
+             VALUES ($1, $2, COALESCE($3, 'General'), COALESCE($4, false), COALESCE($5, '[]'::jsonb), $6)
              RETURNING *`,
-            [name, body, category || null, is_default || false, created_by || null],
+            [
+                name,
+                body,
+                category || null,
+                is_default || false,
+                JSON.stringify(Array.isArray(attachments_json) ? attachments_json : []),
+                created_by || null,
+            ],
         );
         res.json(rows[0]);
     } catch (err) {
@@ -998,17 +1007,28 @@ router.post('/whatsapp-templates', async (req, res) => {
 
 router.put('/whatsapp-templates/:id', async (req, res) => {
     try {
-        const { name, body, category, is_default } = req.body || {};
+        const { name, body, category, is_default, attachments_json } = req.body || {};
+        const attachmentsParam = attachments_json === undefined
+            ? null
+            : JSON.stringify(Array.isArray(attachments_json) ? attachments_json : []);
         const { rows } = await pool.query(
             `UPDATE recruitment_whatsapp_templates
-                SET name       = COALESCE($1, name),
-                    body       = COALESCE($2, body),
-                    category   = COALESCE($3, category),
-                    is_default = COALESCE($4, is_default),
-                    updated_at = NOW()
-              WHERE id = $5
+                SET name             = COALESCE($1, name),
+                    body             = COALESCE($2, body),
+                    category         = COALESCE($3, category),
+                    is_default       = COALESCE($4, is_default),
+                    attachments_json = COALESCE($5::jsonb, attachments_json),
+                    updated_at       = NOW()
+              WHERE id = $6
               RETURNING *`,
-            [name ?? null, body ?? null, category ?? null, is_default ?? null, req.params.id],
+            [
+                name ?? null,
+                body ?? null,
+                category ?? null,
+                is_default ?? null,
+                attachmentsParam,
+                req.params.id,
+            ],
         );
         if (!rows.length) return res.status(404).json({ error: 'Not found' });
         res.json(rows[0]);
@@ -1034,7 +1054,7 @@ router.delete('/whatsapp-templates/:id', async (req, res) => {
 // ============================================================
 router.post('/candidates/:id/send-whatsapp', async (req, res) => {
     try {
-        const { templateId, content } = req.body || {};
+        const { templateId, content, attachments } = req.body || {};
         if (!templateId && !content) {
             return res.status(400).json({ error: 'templateId or content is required' });
         }
@@ -1048,13 +1068,18 @@ router.post('/candidates/:id/send-whatsapp', async (req, res) => {
         const candidate = candRows[0];
 
         let body = content;
+        let finalAttachments = Array.isArray(attachments) ? attachments : [];
         if (templateId) {
             const { rows: tplRows } = await pool.query(
-                `SELECT body FROM recruitment_whatsapp_templates WHERE id = $1`,
+                `SELECT body, attachments_json FROM recruitment_whatsapp_templates WHERE id = $1`,
                 [templateId],
             );
             if (!tplRows.length) return res.status(404).json({ error: 'Template not found' });
             body = tplRows[0].body;
+            // Override attachments with the template's if the caller didn't supply any.
+            if (!finalAttachments.length && Array.isArray(tplRows[0].attachments_json)) {
+                finalAttachments = tplRows[0].attachments_json;
+            }
         }
 
         const vars = buildTemplateVars(candidate);
@@ -1071,12 +1096,16 @@ router.post('/candidates/:id/send-whatsapp', async (req, res) => {
                 templateId || null,
                 body,
                 candidate.whatsapp || candidate.phone,
-                JSON.stringify({ trigger: 'manual', actor: req.headers['x-user-id'] || null }),
+                JSON.stringify({
+                    trigger: 'manual',
+                    actor: req.headers['x-user-id'] || null,
+                    attachments_count: finalAttachments.length,
+                }),
             ],
         );
         await recruitmentWhatsappQueue.add(
             'send-recruitment-whatsapp',
-            { logId: logRows[0].id, candidateId: candidate.id, content: body },
+            { logId: logRows[0].id, candidateId: candidate.id, content: body, attachments: finalAttachments },
             { attempts: 3, backoff: { type: 'exponential', delay: 5000 } },
         );
 

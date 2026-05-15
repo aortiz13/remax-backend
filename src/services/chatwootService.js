@@ -198,10 +198,66 @@ export async function sendMessage({ conversationId, content }) {
     return data;
 }
 
+// ─── Send message with binary attachments ────────────────────────
+// Chatwoot accepts attachments only via multipart/form-data. We
+// download each attachment URL ourselves and forward the bytes as
+// attachments[]. The api_access_token header stays the same; we MUST
+// NOT set Content-Type — FormData adds the boundary.
+//
+// `attachments` shape: [{ url, filename, mimeType, size? }, ...]
+// `downloader` is optional (defaults to fetch) — useful for tests.
+//
+// WhatsApp Business per-file limits (enforced by Meta, not us):
+//   video / audio: 16 MB | image: 5 MB | document: 100 MB
+export async function sendMessageWithAttachments({ conversationId, content, attachments = [], downloader = fetch }) {
+    if (!attachments.length) {
+        return sendMessage({ conversationId, content });
+    }
+    requireConfig();
+    const url = `${CHATWOOT_API_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`;
+
+    const form = new FormData();
+    form.append('content', content || '');
+    form.append('message_type', 'outgoing');
+    form.append('private', 'false');
+    // No content_type field — Chatwoot infers from the file mimeType.
+
+    for (const att of attachments) {
+        if (!att?.url) continue;
+        const r = await downloader(att.url);
+        if (!r.ok) throw new Error(`Attachment download failed (${r.status}) for ${att.url}`);
+        const buf = Buffer.from(await r.arrayBuffer());
+        const mime = att.mimeType || r.headers.get('content-type') || 'application/octet-stream';
+        const blob = new Blob([buf], { type: mime });
+        const name = att.filename || att.url.split('/').pop() || 'attachment';
+        form.append('attachments[]', blob, name);
+    }
+
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: { api_access_token: CHATWOOT_API_TOKEN },
+        body: form,
+    });
+    const text = await resp.text();
+    let json;
+    try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+    if (!resp.ok) {
+        const err = new Error(`Chatwoot POST messages (multipart) → ${resp.status}: ${text.slice(0, 400)}`);
+        err.status = resp.status;
+        err.body = json;
+        throw err;
+    }
+    return json;
+}
+
 // ─── End-to-end helper ────────────────────────────────────────────
 // Used both by the BullMQ worker (recruitment automation) and by any
 // future ad-hoc endpoint that wants to "just send a WhatsApp".
-export async function sendWhatsappToCandidate({ candidate, content }) {
+//
+// If `attachments` has items, the message is sent multipart and they
+// are uploaded as Chatwoot attachments[] (which Chatwoot then forwards
+// to WhatsApp as media).
+export async function sendWhatsappToCandidate({ candidate, content, attachments = [] }) {
     const contact = await findOrCreateContact({
         candidateId: candidate.id,
         name: `${candidate.first_name || ''} ${candidate.last_name || ''}`.trim() || 'Candidato',
@@ -214,7 +270,9 @@ export async function sendWhatsappToCandidate({ candidate, content }) {
         contactId: contact.id,
         phoneE164,
     });
-    const message = await sendMessage({ conversationId: conversation.id, content });
+    const message = attachments?.length
+        ? await sendMessageWithAttachments({ conversationId: conversation.id, content, attachments })
+        : await sendMessage({ conversationId: conversation.id, content });
     return {
         chatwoot_contact_id: contact.id,
         chatwoot_conversation_id: conversation.id,
